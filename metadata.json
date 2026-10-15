@@ -1,0 +1,6 @@
+{
+  "name": "PixelBoost",
+  "description": "AI-powered image upscaling and super-resolution studio for enhancing photos with crisp detail.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

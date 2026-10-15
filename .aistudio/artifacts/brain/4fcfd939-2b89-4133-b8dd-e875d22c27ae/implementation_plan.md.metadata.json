@@ -1,0 +1,6 @@
+{
+  "summary": "Comprehensive architecture plan to fix upscaling crashes, integrate zero-permission system photo picker, implement high-quality Lanczos bicubic super-resolution fallback, sync platform metadata and strings to PixelBoost, and resolve remaining logic bugs.",
+  "updatedAt": "2026-10-15T05:43:03.411999925Z",
+  "requestFeedback": true,
+  "userFacing": true
+}
