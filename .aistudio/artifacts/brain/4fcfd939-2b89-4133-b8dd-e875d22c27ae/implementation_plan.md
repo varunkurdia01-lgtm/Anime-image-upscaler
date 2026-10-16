@@ -1,64 +1,68 @@
-# PixelBoost Comprehensive Fix & Architecture Plan
+# Multi-Backend Auto-Tuning & Empirical Hardware Benchmarking Plan (Final Revision)
 
-Fixes all remaining stability issues, logic bugs, and crashes in PixelBoost by modernizing the image ingestion pipeline, introducing a multi-tier super-resolution engine with Lanczos/bicubic fallback, synchronizing platform branding, and cleaning legacy code.
+Implement an evidence-based multi-backend benchmarking and selection engine in PixelBoost that measures and compares MNN Vulkan GPU, MNN CPU multi-threaded NEON, and ONNX Runtime XNNPACK. The architecture combines single-tile screening, multi-candidate multi-tile end-to-end validation, realistic device-aligned calibration budgets, asynchronous cancellation safety, MNN header-compliant Vulkan options, strict cache invalidation, and explicitly scoped resolution fidelity handling.
 
 ---
 
 ### User Review & Critical Decisions
 
 > [!IMPORTANT]
-> Based on your confirmed selections:
-> - **Zero-Permission Photo Picker**: Replace manual MediaStore cursor queries and deprecated `READ_EXTERNAL_STORAGE` / `READ_MEDIA_IMAGES` permissions with Jetpack `ActivityResultContracts.PickMultipleVisualMedia()`, fully adhering to Google Play policies and guaranteeing reliable image loading across all Android versions (Android 10–15+).
-> - **Lanczos/Bicubic Fallback**: When on-device neural inference encounters missing GPU drivers (e.g. Vulkan crashes), memory constraints, or unsupported tensor shapes, the engine seamlessly invokes a high-order bicubic/Lanczos super-resolution algorithm with edge-preserving unsharp masking. The user ALWAYS receives a crisp upscaled image without crashes or freezes.
-> - **Identity Synchronization**: Synchronize `metadata.json`, `app/src/main/res/values/strings.xml`, and `settings.gradle.kts` to `"PixelBoost"`, removing all legacy `"Empty Project"` placeholders.
+> **Summary of Revisions & Critical Corrections**:
+> 1. **Realistic Calibration Budget & Cancellation Safety**:
+>    - Given measured on-device execution (~10.2s–11.36s per Vulkan tile on Snapdragon 732G), the previous 8s trial and 20s overall budgets were completely unrealistic.
+>    - **Revised Budget**: 30-second ceiling per individual candidate trial and a 90-second total calibration timeout. Screening trials are streamlined to 1 warm-up + 2 timed trials (averaging or taking the lower stable latency) to minimize total calibration time.
+>    - **Cancellation & Mutual Exclusion**: Native C++ execution (`interpreter->runSession()`) cannot be forcefully preempted mid-kernel by Kotlin coroutines. Cancellation flags are checked between tiles, and `processMutex` ensures native sessions and memory buffers are never destroyed or reallocated while an in-flight native inference call finishes.
+> 2. **Multi-Candidate Validation with Fallback**:
+>    - Stage 1 screens and ranks all available backends by tile latency.
+>    - Stage 2 runs a representative multi-tile workload (e.g. 4-tile grid) on the top candidate.
+>    - If the #1 candidate fails quality validation (MAE, seams, dimensions) or degrades in multi-tile end-to-end throughput (e.g. JNI/memory sync bottlenecks), evaluation cascades to candidate #2 rather than halting or failing the process.
+> 3. **Explicit Scoping of the OOM Silent-Downscaling Path**:
+>    - An active path in `InferenceEngine.kt` silently downscales input images (0.75x, 0.5x) if `Bitmap.createBitmap` throws an `OutOfMemoryError`.
+>    - **Fidelity Scoping**: Large-image exact resolution fidelity is explicitly tracked as an open limitation of the current memory architecture. We scope its resolution into a distinct Phase 2 (replacing silent downscaling with pre-flight heap budgeting and fail-fast notifications) so that current claims do not promise exact output on memory-constrained devices until the memory pipeline is refactored.
+> 4. **MNN Header-Compliant Vulkan Configuration**:
+>    - Audited against `mnn_3.6.1_development/include/MNN/MNNForwardType.h`.
+>    - Removed OpenCL-only flags (`MNN_GPU_TUNING_FAST`, `MNN_GPU_MEMORY_IMAGE`). Configured Vulkan with `MNN_GPU_TUNING_WIDE` and `MNN_GPU_RECORD_BATCH`.
 
 ---
 
 ### 1. Overview & Core Concept
 
-- **What It Does**: PixelBoost is an AI-powered super-resolution and photo enhancement application for Android. It enables users to select single or multiple photos, configure scale factors (2× or 4×), format containers (PNG, JPG, WEBP), and compression quality tiers, view processing progress in real time, compare original vs enhanced images with an interactive split comparison slider, export to the device Gallery via MediaStore, and maintain a local history archive.
-- **Target Audience**: Photographers, digital artists, creators, and everyday smartphone users restoring low-resolution or legacy photos.
-- **Key Value**: 100% crash-free upscaling that gracefully falls back to high-grade mathematical super-resolution whenever hardware or neural runtimes encounter failure.
+- **What It Does**: Evaluates MNN Vulkan, MNN CPU, and ONNX Runtime on the user's Android device using controlled single-tile screening followed by multi-candidate multi-tile validation. Selects the most efficient verified backend, caches the selection with a comprehensive hardware/configuration fingerprint, and reports empirical diagnostics to `Downloads/PixelBoost/PixelBoost_Benchmark.txt`.
+- **Target Audience / Persona**: Users across diverse device tiers (Snapdragon, Dimensity, Tensor, Exynos) with varying CPU-to-GPU compute ratios.
+- **Key Value**: Delivers the fastest empirically validated execution provider for the user's specific chipset without guesswork, accompanied by transparent, reproducible benchmark metrics in `Downloads/PixelBoost/PixelBoost_Benchmark.txt`.
 
 ---
 
 ### 2. User Experience & Visual Design
 
 - **Key User Flows**:
-  1. *Photo Ingestion*:
-     - Home screen "Choose from Gallery" launches the native Android Photo Picker directly.
-     - Selected photos seamlessly flow to `EnhanceOptionsScreen` with thumbnail previews and badge counts.
-  2. *Enhancement Options*:
-     - User selects 2× vs 4× scale factor, export container (JPG/PNG/WEBP), and quality preset.
-     - Tapping "Start Enhance" transitions smoothly to `ProcessingScreen`.
-  3. *Processing & Progress*:
-     - Neumorphic circular progress meter indicates percentage completion.
-     - Cancel button stops background inference cooperatively and clears memory buffers.
-  4. *Result & Comparison*:
-     - Interactive before/after split slider allowing instant inspection of details and sharpness.
-     - Metadata tray displaying source resolution (e.g., 800×600) vs enhanced output (e.g., 3200×2400).
-     - Save to Gallery button with instant visual feedback ("Saved to Photos").
-  5. *History Archive*:
-     - Browsable grid of saved images with timestamps, labels, and cache management.
-- **Visual Identity**:
-  - Soft ceramic surfaces (`#EBF0F5`), electric sky-blue accents (`#0284C7`), subtle dual-direction shadows, and crisp typography powered by the Inter font family.
+  1. *Background Calibration (First Run or Stale Cache)*:
+     - Runs Stage 1 screening on available backends followed by Stage 2 multi-tile confirmation.
+     - Displays a subtle badge/toast showing the winning backend, measured median tile latency, and validation status.
+  2. *Settings & Diagnostics Card (`SettingsScreen.kt`)*:
+     - **Active Engine Card**: Displays currently used backend, designation mode (`Auto-Tuned Winner` vs `Manual Override`), median tile latency, and validation status.
+     - **Manual Backend Selector Dropdown**: Provides options `Auto (Recommended)`, `MNN Vulkan (GPU)`, `MNN CPU (ARM NEON)`, and `ONNX Runtime (XNNPACK)`.
+     - **"Run Hardware Benchmark" Action**: Launches a diagnostic test dialog with live progress for each candidate backend, displaying a comparative results matrix.
+     - **"Open Benchmark Report" Action**: Directly opens or views `Downloads/PixelBoost/PixelBoost_Benchmark.txt`.
+- **Visual Identity & Theme**:
+  - Material Design 3 and PixelBoost ceramic tactile styling (`SurfaceContainerLowest`, `ceramicShadow`, `Primary` accent).
+  - Clear visual demarcation between verified empirical measurements and unverified items.
 
 ---
 
 ### 3. Key Product Decisions & Trade-Offs
 
-- **Multi-Tier Inference Hierarchy**:
-  - *Chosen Approach*:
-    1. *Vulkan Safety Check*: Only attempt Vulkan GPU execution if the driver explicitly exposes compute queues and sufficient memory; prevent native signal 11 (`SIGSEGV`).
-    2. *MNN / ONNX CPU Execution*: Multi-threaded CPU neural super-resolution for devices with sufficient memory.
-    3. *Lanczos/Bicubic Super-Resolution Fallback*: If native libraries, models, or memory limits fail, immediately fall back to high-order bicubic scaling paired with adaptive unsharp masking.
-  - *Why*: Eliminates all app crashes while guaranteeing that the user always gets an enhanced image.
-- **Zero-Permission Photo Picker**:
-  - *Chosen Approach*: `PickMultipleVisualMedia(maxItems = 10)` in `HomeScreen` and `ImagePickerScreen`.
-  - *Why*: Completely eliminates the need for storage permissions (`READ_EXTERNAL_STORAGE` / `READ_MEDIA_IMAGES`), preventing permission-denied dead ends.
-- **Memory Safety & OOM Prevention**:
-  - *Chosen Approach*: In addition to `android:largeHeap="true"`, intermediate bitmap buffers are recycled immediately after tile stitching, and all memory allocations are enclosed in `catch (t: Throwable)`.
-  - *Why*: Prevents native and Dalvik heap starvation when handling large multi-megapixel photos.
+- **Decision 1: Realistic Calibration Budget & Asynchronous Safety**
+  - *Chosen Approach*: 30s per-trial timeout with a 90s total calibration budget. Native inference finishes the active tile cleanly before any session release, with mutex-guarded synchronization.
+  - *Why*: Accommodates real-world mid-range GPU shader latency (~10.2s–11.36s/tile) while preventing native memory corruption from premature preemption.
+- **Decision 2: Cascading Multi-Candidate Multi-Tile Validation**
+  - *Chosen Approach*: If the Stage 1 winner fails validation (MAE, seams, dimensions) or drops throughput in multi-tile mode, the pipeline automatically evaluates candidate #2.
+  - *Why*: Guarantees the system falls back to a verified working engine rather than stranding the user.
+- **Decision 3: Vulkan Schedule Configuration Alignment**
+  - *Chosen Approach*: Replace OpenCL tuning flags in `MNNBenchmark.cpp` with `MNN_GPU_TUNING_WIDE` and `MNN_GPU_RECORD_BATCH` as specified in MNN 3.6.1 headers.
+  - *Why*: Ensures the Vulkan backend is configured as designed by MNN before benchmarking against CPU.
+- **Decision 4: Scoping of Resolution Fidelity & OOM Handling**
+  - *Chosen Approach*: Phase 1 focuses strictly on backend benchmarking, auto-tuning, and diagnostic reporting. The known OOM downscaling fallback in `InferenceEngine.kt` is marked as a documented constraint and scheduled for clean elimination in a follow-up memory budgeting phase.
 
 ---
 
@@ -66,41 +70,118 @@ Fixes all remaining stability issues, logic bugs, and crashes in PixelBoost by m
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│                        Jetpack Compose UI Layer                        │
-│                                                                        │
-│   HomeScreen ──────► System Photo Picker ──────► EnhanceOptionsScreen  │
-│        ▲                                                   │           │
-│        │                                                   ▼           │
-│   HistoryScreen ◄────── ResultScreen ◄────────── ProcessingScreen      │
-└────────────────────────────────────┬───────────────────────────────────┘
-                                     │
-                                     ▼
+│                          SettingsScreen / UI                           │
+│  - Active Engine Card (Auto Winner vs Manual Override)                 │
+│  - Engine Override Selector (Auto / MNN Vulkan / MNN CPU / ONNX)       │
+│  - "Run Hardware Benchmark" Button & Diagnostics Dialog                │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │
+                                   ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│                     AppViewModel & Data Layer                          │
-│   • Batch Queue Management          • MediaStore Scoped Storage Export │
-│   • Cancellation & Memory Safety    • Room Database (HistoryEntity)    │
-└────────────────────────────────────┬───────────────────────────────────┘
-                                     │
-                                     ▼
+│                          AppViewModel                                  │
+│  - activeBackend: StateFlow<BackendSelection>                          │
+│  - calibrationMatrix: StateFlow<List<BackendBenchmarkResult>>          │
+│  - isCalibrating: StateFlow<Boolean>                                   │
+│  - runHardwareCalibration(forceRefresh: Boolean)                       │
+│  - Stores manualOverride separately from calibratedWinner in prefs    │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │ (Guarded by processMutex)
+                                   ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│                  InferenceEngine Multi-Tier Pipeline                   │
-│                                                                        │
-│   ┌─────────────────────┐   Failure   ┌────────────────────────────┐   │
-│   │ 1. MNN Vulkan Probe │ ──────────► │ 2. MNN CPU / ONNX Model    │   │
-│   │ (Pre-flight GPU)    │             │ (Multi-threaded NCHW)      │   │
-│   └─────────────────────┘             └─────────────┬──────────────┘   │
-│                                                     │ Failure / OOM    │
-│                                                     ▼                  │
-│                                       ┌────────────────────────────┐   │
-│                                       │ 3. Lanczos/Bicubic Fallback│   │
-│                                       │ (Edge-preserving Unsharp)  │   │
-│                                       └────────────────────────────┘   │
+│                        InferenceEngine                                 │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │                    BackendAutoTuner                              │  │
+│  │  1. Preflight: Verify Vulkan hardware level, MNN lib, ONNX model │  │
+│  │  2. MNN Vulkan Config: MNN_GPU_TUNING_WIDE | MNN_GPU_RECORD_BATCH│  │
+│  │  3. Stage 1 Screening: 1 warm-up + 2 timed runs per backend      │  │
+│  │     - 30s per-trial timeout, 90s total budget                    │  │
+│  │     - Safe cancellation checks between native dispatches         │  │
+│  │     - Rank candidates by latency                                 │  │
+│  │  4. Stage 2 Multi-Candidate Validation:                          │  │
+│  │     - Test #1 candidate on 4-tile grid (end-to-end + seams + MAE)│  │
+│  │     - If #1 fails validation or throughput drops, test #2        │  │
+│  │     - Confirm verified winner                                    │  │
+│  │  5. Store result with comprehensive fingerprint cache key        │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                                  │                                     │
+│         ┌────────────────────────┼────────────────────────┐            │
+│         ▼                        ▼                        ▼            │
+│  ┌──────────────┐        ┌──────────────┐         ┌──────────────┐     │
+│  │  MNN Vulkan  │        │   MNN CPU    │         │ ONNX XNNPACK │     │
+│  │ (GPU Shader) │        │ (Multi-NEON) │         │ (SIMD FP16)  │     │
+│  └──────────────┘        └──────────────┘         └──────────────┘     │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │
+                                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│              Downloads/PixelBoost/PixelBoost_Benchmark.txt             │
+│  - Device & SoC Hardware Profile (CPU Cluster, GPU, Memory)            │
+│  - Stage 1 Screening Matrix (Trials, Median Latency, Availability)     │
+│  - Stage 2 Multi-Tile Validation (End-to-End Latency, MAE, Seams)      │
+│  - Calibration Overhead Duration (Measured ms)                         │
+│  - Active Engine Selection (Auto Winner vs Manual Override Flag)       │
+│  - Documented Constraints (OOM downscaling note until Phase 2)         │
+│  - Full Batch Upscaling Execution Metrics & Per-Tile Latencies         │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Step-by-Step Implementation Strategy**:
-  1. *Platform Identity*: Update `metadata.json`, `app/src/main/res/values/strings.xml`, and `settings.gradle.kts` to `"PixelBoost"`.
-  2. *Photo Picker Modernization*: Refactor `HomeScreen.kt` and `ImagePickerScreen.kt` to use `ActivityResultContracts.PickMultipleVisualMedia()`, and remove unused storage permission declarations from `AndroidManifest.xml`.
-  3. *InferenceEngine Robust Fallback*: Add high-order bicubic/Lanczos super-resolution with edge sharpening in `InferenceEngine.kt`, ensuring non-blocking fallback if native execution fails or throws.
-  4. *AppViewModel Memory & Error Guard*: Ensure `startProcessing` handles `Throwable` and falls back cleanly, updating the UI with precise status tags (`4× AI` or `4× Enhanced`).
-  5. *Verification*: Verify build with `compile_applet` and test with local unit tests.
+#### Core Data Entities:
+
+```kotlin
+data class BackendBenchmarkResult(
+    val backendName: String,
+    val isConfiguredAndAvailable: Boolean,
+    val unAvailableReason: String? = null,
+    val warmUpLatencyNanos: Long = 0L,
+    val trialLatenciesNanos: List<Long> = emptyList(),
+    val medianLatencyNanos: Long = 0L,
+    val outputDimensionsVerified: Boolean = false,
+    val pixelEntropyValid: Boolean = false,
+    val meanAbsoluteErrorVsRef: Float? = null,
+    val seamDiscontinuityMaxDelta: Float? = null,
+    val multiTileValidationNanos: Long = 0L,
+    val validationPassed: Boolean = false,
+    val isSelectedWinner: Boolean = false
+)
+
+data class CalibrationSummary(
+    val timestamp: Long,
+    val configurationFingerprint: String,
+    val calibrationWallClockDurationNanos: Long,
+    val results: List<BackendBenchmarkResult>,
+    val winningBackend: String,
+    val activeBackendUsed: String,
+    val isManualOverrideActive: Boolean
+)
+```
+
+#### Comprehensive Fingerprint & Cache Policy:
+- Cache Fingerprint:
+  `pb_v2_${deviceModel}_api${sdkInt}_${modelName}_size${modelBytes}_mod${modelLastMod}_scale${scale}_tile${tileSize}_pad${pad}_threads${cpuThreads}_code${versionCode}`
+- Invalidation Triggers:
+  - Fingerprint mismatch (scale changed, tile changed, model updated, OS updated).
+  - Explicit user re-test from Settings.
+  - Corrupted or partial calibration record.
+
+#### Benchmarking Safety & Mutual Exclusion:
+- Calibration acquires `processMutex` ensuring complete mutual exclusion with active image enhancement.
+- Enforces a 90-second total calibration budget and 30-second individual trial timeout.
+- Native inference calls run to tile completion before releasing sessions or buffers.
+
+---
+
+### 5. Implementation Roadmap (Post-Approval)
+
+- **Step 1: MNN Vulkan Configuration Audit & Header Alignment**:
+  - Update `MNNBenchmark.cpp` to use official MNN 3.6.1 Vulkan flags (`MNN_GPU_TUNING_WIDE`, `MNN_GPU_RECORD_BATCH`) and isolate session resets.
+- **Step 2: Backend Auto-Tuner & Multi-Candidate Validation (`InferenceEngine.kt`)**:
+  - Implement preflight checks, 1 warm-up + 2 timed screening runs (30s trial timeout, 90s total budget), median computation, and multi-candidate 4-tile validation with fallback.
+- **Step 3: State Management & Invalidation (`AppViewModel.kt`)**:
+  - Wire calibration caching with comprehensive fingerprinting.
+  - Store manual override separately from auto-tuned winner.
+- **Step 4: Diagnostics UI in Settings (`SettingsScreen.kt`)**:
+  - Add Active Engine Card, manual override selector, "Run Hardware Benchmark" dialog, and report viewer action.
+- **Step 5: Upgraded Benchmark Diagnostics (`PixelBoost_Benchmark.txt`)**:
+  - Expand benchmark logging with preflight checks, screening matrix, multi-tile validation, and empirical timing breakdowns.
+- **Step 6: Build Verification & Compilation**:
+  - Execute `compile_applet` and verify 0 compilation errors across Kotlin and C++.

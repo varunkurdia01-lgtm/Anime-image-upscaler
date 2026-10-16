@@ -17,9 +17,6 @@
 #include <MNN/Tensor.hpp>
 #include <MNN/ErrorCode.hpp>
 #include <MNN/MNNForwardType.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/uio.h>
 
 #define LOG_TAG "PIXELBOOST_MNN_CPU_BENCHMARK"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -869,7 +866,7 @@ Java_com_example_MNNBenchmark_nativeRunVulkanBenchmarkSuite(
     MNN::ScheduleConfig vkConfig;
     vkConfig.type = MNN_FORWARD_VULKAN;
     vkConfig.numThread = 4;
-    vkConfig.mode = MNN_GPU_TUNING_NONE;
+    vkConfig.mode = MNN_GPU_TUNING_WIDE | MNN_GPU_RECORD_BATCH;
     MNN::Session* vkSession = interpreter->createSession(vkConfig);
     auto tVkSEnd = std::chrono::steady_clock::now();
     double vkSessionTimeMs = std::chrono::duration<double, std::milli>(tVkSEnd - tVkSStart).count();
@@ -1102,6 +1099,17 @@ Java_com_example_MNNBenchmark_nativeRunVulkanBenchmarkSuite(
     return env->NewStringUTF(outStr.c_str());
 }
 
+struct ProductionSessionState {
+    std::shared_ptr<MNN::Interpreter> interpreter;
+    MNN::Session* session = nullptr;
+    std::string modelPath;
+    int backendType = -1;
+    int lastTensorW = -1;
+    int lastTensorH = -1;
+    std::mutex mtx;
+};
+static ProductionSessionState g_prod_state;
+
 JNIEXPORT jint JNICALL
 Java_com_example_InferenceEngine_nativeProcessWithMNN(
     JNIEnv* env,
@@ -1110,6 +1118,8 @@ Java_com_example_InferenceEngine_nativeProcessWithMNN(
     jobject jInputBitmap,
     jobject jOutputBitmap,
     jint backendType,
+    jint requestedTileSize,
+    jint cpuThreads,
     jobject jProgressListener,
     jlongArray jMetricsOut
 ) {
@@ -1136,68 +1146,95 @@ Java_com_example_InferenceEngine_nativeProcessWithMNN(
 
     int inW = inInfo.width;
     int inH = inInfo.height;
-    int aiScale = 4;
-    int requestedScale = 4;
+    int scale = (outInfo.width == static_cast<uint32_t>(inW * 2) && outInfo.height == static_cast<uint32_t>(inH * 2)) ? 2 : 4;
+    int expectedOutW = inW * scale;
+    int expectedOutH = inH * scale;
 
-    if (static_cast<int>(outInfo.width) == inW * 2 && static_cast<int>(outInfo.height) == inH * 2) {
-        requestedScale = 2;
-    } else if (static_cast<int>(outInfo.width) == inW * 4 && static_cast<int>(outInfo.height) == inH * 4) {
-        requestedScale = 4;
-    } else {
-        LOGE("nativeProcessWithMNN: output bitmap dimension mismatch (%ux%u vs expected %dx%d or %dx%d)",
-             outInfo.width, outInfo.height, inW * 2, inH * 2, inW * 4, inH * 4);
+    if (static_cast<int>(outInfo.width) != expectedOutW || static_cast<int>(outInfo.height) != expectedOutH) {
+        LOGE("nativeProcessWithMNN: output bitmap dimension mismatch (%ux%u vs expected %dx%d)",
+             outInfo.width, outInfo.height, expectedOutW, expectedOutH);
         return 3;
     }
 
-    // 1. Create interpreter
+    std::lock_guard<std::mutex> lock(g_prod_state.mtx);
+
+    // 1. Session creation or warm reuse
     auto tInitStart = std::chrono::steady_clock::now();
-    auto interpreter = std::shared_ptr<MNN::Interpreter>(MNN::Interpreter::createFromFile(modelPath.c_str()));
-    if (!interpreter) {
-        LOGE("nativeProcessWithMNN: failed to create interpreter from %s", modelPath.c_str());
-        return 4;
-    }
+    std::shared_ptr<MNN::Interpreter> interpreter;
+    MNN::Session* session = nullptr;
+    bool sessionReused = false;
 
-    // 2. Create session
-    MNN::ScheduleConfig config;
-    if (backendType == 0) {
-        config.type = MNN_FORWARD_VULKAN;
-        config.numThread = 4;
-        config.mode = MNN_GPU_TUNING_NONE;
+    if (g_prod_state.interpreter && g_prod_state.session &&
+        g_prod_state.modelPath == modelPath && g_prod_state.backendType == backendType) {
+        interpreter = g_prod_state.interpreter;
+        session = g_prod_state.session;
+        sessionReused = true;
     } else {
-        config.type = MNN_FORWARD_CPU;
-        config.numThread = 4;
-    }
+        if (g_prod_state.interpreter && g_prod_state.session) {
+            g_prod_state.interpreter->releaseSession(g_prod_state.session);
+            g_prod_state.session = nullptr;
+            g_prod_state.interpreter.reset();
+        }
+        g_prod_state.lastTensorW = -1;
+        g_prod_state.lastTensorH = -1;
 
-    MNN::Session* session = interpreter->createSession(config);
-    if (!session) {
-        LOGE("nativeProcessWithMNN: createSession failed (backendType = %d)", backendType);
-        return 1;
-    }
+        interpreter = std::shared_ptr<MNN::Interpreter>(MNN::Interpreter::createFromFile(modelPath.c_str()));
+        if (!interpreter) {
+            LOGE("nativeProcessWithMNN: failed to create interpreter from %s", modelPath.c_str());
+            return 4;
+        }
 
-    if (backendType == 0) {
-        int backends[4] = {-1, -1, -1, -1};
-        interpreter->getSessionInfo(session, MNN::Interpreter::BACKENDS, backends);
-        if (backends[0] != MNN_FORWARD_VULKAN) {
-            LOGE("nativeProcessWithMNN: CPU fallback detected for Vulkan session (backend = %d)", backends[0]);
-            interpreter->releaseSession(session);
+        MNN::ScheduleConfig config;
+        config.numThread = (cpuThreads >= 1 && cpuThreads <= 8) ? cpuThreads : 4;
+
+        MNN::BackendConfig backendConfig;
+        backendConfig.precision = MNN::BackendConfig::Precision_Low;
+        backendConfig.power = MNN::BackendConfig::Power_High;
+        config.backendConfig = &backendConfig;
+
+        if (backendType == 0) {
+            config.type = MNN_FORWARD_VULKAN;
+            config.mode = MNN_GPU_TUNING_WIDE | MNN_GPU_RECORD_BATCH;
+        } else {
+            config.type = MNN_FORWARD_CPU;
+        }
+
+        session = interpreter->createSession(config);
+        if (!session) {
+            LOGE("nativeProcessWithMNN: createSession failed (backendType = %d)", backendType);
             return 1;
         }
+
+        if (backendType == 0) {
+            int backends[4] = {-1, -1, -1, -1};
+            interpreter->getSessionInfo(session, MNN::Interpreter::BACKENDS, backends);
+            if (backends[0] != MNN_FORWARD_VULKAN) {
+                LOGE("nativeProcessWithMNN: CPU fallback detected for Vulkan session (backend = %d)", backends[0]);
+                interpreter->releaseSession(session);
+                return 1;
+            }
+        }
+
+        g_prod_state.interpreter = interpreter;
+        g_prod_state.session = session;
+        g_prod_state.modelPath = modelPath;
+        g_prod_state.backendType = backendType;
+        g_prod_state.lastTensorW = -1;
+        g_prod_state.lastTensorH = -1;
     }
 
     auto tInitEnd = std::chrono::steady_clock::now();
     int64_t sessionInitNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(tInitEnd - tInitStart).count();
 
-    // 3. Lock bitmap pixels
+    // 2. Lock bitmap pixels
     void* inPixels = nullptr;
     if (AndroidBitmap_lockPixels(env, jInputBitmap, &inPixels) < 0 || !inPixels) {
-        interpreter->releaseSession(session);
         return 3;
     }
 
     void* outPixels = nullptr;
     if (AndroidBitmap_lockPixels(env, jOutputBitmap, &outPixels) < 0 || !outPixels) {
         AndroidBitmap_unlockPixels(env, jInputBitmap);
-        interpreter->releaseSession(session);
         return 3;
     }
 
@@ -1216,14 +1253,45 @@ Java_com_example_InferenceEngine_nativeProcessWithMNN(
     jmethodID isInterruptedMethod = env->GetMethodID(threadClass, "isInterrupted", "()Z");
     jobject currentThread = env->CallStaticObjectMethod(threadClass, currentThreadMethod);
 
-    int tileSize = 128;
+    int tileSize = (requestedTileSize >= 64 && requestedTileSize <= 512) ? requestedTileSize : 128;
     int pad = 8;
+    int targetTileW = std::min(inW, tileSize + 2 * pad);
+    int targetTileH = std::min(inH, tileSize + 2 * pad);
+
+    // Constant-shape tensor configuration - zero mid-loop resizes
+    MNN::Tensor* inputTensor = interpreter->getSessionInput(session, nullptr);
+    if (!inputTensor) {
+        LOGE("nativeProcessWithMNN: getSessionInput returned null");
+        AndroidBitmap_unlockPixels(env, jOutputBitmap);
+        AndroidBitmap_unlockPixels(env, jInputBitmap);
+        return 2;
+    }
+
+    if (g_prod_state.lastTensorW != targetTileW || g_prod_state.lastTensorH != targetTileH) {
+        interpreter->resizeTensor(inputTensor, {1, 3, targetTileH, targetTileW});
+        interpreter->resizeSession(session);
+        g_prod_state.lastTensorW = targetTileW;
+        g_prod_state.lastTensorH = targetTileH;
+    }
+    inputTensor = interpreter->getSessionInput(session, nullptr);
+
+    MNN::Tensor* outTensor = interpreter->getSessionOutput(session, nullptr);
+    if (!outTensor) {
+        AndroidBitmap_unlockPixels(env, jOutputBitmap);
+        AndroidBitmap_unlockPixels(env, jInputBitmap);
+        return 2;
+    }
+    std::unique_ptr<MNN::Tensor> hostInput(new MNN::Tensor(inputTensor, MNN::Tensor::CAFFE));
+    std::unique_ptr<MNN::Tensor> hostOutput(new MNN::Tensor(outTensor, MNN::Tensor::CAFFE));
+
     int totalTilesX = (inW + tileSize - 1) / tileSize;
     int totalTilesY = (inH + tileSize - 1) / tileSize;
     int totalTiles = totalTilesX * totalTilesY;
     int tilesProcessed = 0;
 
+    int64_t totalPrepNanos = 0;
     int64_t totalInferNanos = 0;
+    int64_t totalStitchNanos = 0;
     int64_t minInferNanos = std::numeric_limits<int64_t>::max();
     int64_t maxInferNanos = 0;
     int inferCount = 0;
@@ -1236,9 +1304,6 @@ Java_com_example_InferenceEngine_nativeProcessWithMNN(
     bool failed = false;
     bool cancelled = false;
 
-    int lastTensorW = -1;
-    int lastTensorH = -1;
-
     for (int y = 0; y < inH && !failed && !cancelled; y += tileSize) {
         for (int x = 0; x < inW && !failed && !cancelled; x += tileSize) {
             // Check cancellation
@@ -1248,46 +1313,47 @@ Java_com_example_InferenceEngine_nativeProcessWithMNN(
                 break;
             }
 
-            int startX = std::max(0, x - pad);
-            int startY = std::max(0, y - pad);
-            int endX = std::min(inW, x + tileSize + pad);
-            int endY = std::min(inH, y + tileSize + pad);
-            int curW = endX - startX;
-            int curH = endY - startY;
-
-            // Resize session input tensor only if dimensions changed
-            MNN::Tensor* inputTensor = interpreter->getSessionInput(session, nullptr);
-            if (!inputTensor) {
-                LOGE("nativeProcessWithMNN: getSessionInput returned null");
-                failed = true;
-                break;
+            int startX = x - pad;
+            int startY = y - pad;
+            if (startX < 0) startX = 0;
+            if (startY < 0) startY = 0;
+            if (startX + targetTileW > inW) {
+                startX = std::max(0, inW - targetTileW);
             }
-            if (curW != lastTensorW || curH != lastTensorH) {
-                interpreter->resizeTensor(inputTensor, {1, 3, curH, curW});
-                interpreter->resizeSession(session);
-                lastTensorW = curW;
-                lastTensorH = curH;
+            if (startY + targetTileH > inH) {
+                startY = std::max(0, inH - targetTileH);
             }
-            inputTensor = interpreter->getSessionInput(session, nullptr);
 
-            std::unique_ptr<MNN::Tensor> hostInput(new MNN::Tensor(inputTensor, MNN::Tensor::CAFFE));
+            int validStartX = x;
+            int validStartY = y;
+            int validEndX = std::min(inW, x + tileSize);
+            int validEndY = std::min(inH, y + tileSize);
+            int validW = validEndX - validStartX;
+            int validH = validEndY - validStartY;
+
+            int offsetInTileX = validStartX - startX;
+            int offsetInTileY = validStartY - startY;
+
+            // Preprocessing: RGBA -> float NCHW [0.0, 1.0]
+            auto tPrepStart = std::chrono::steady_clock::now();
             float* hData = hostInput->host<float>();
-            int planeSize = curH * curW;
+            int planeSize = targetTileH * targetTileW;
 
-            // Extract RGBA from inBytePtr -> float NCHW [0.0, 1.0]
-            for (int r = 0; r < curH; ++r) {
+            for (int r = 0; r < targetTileH; ++r) {
                 int srcY = startY + r;
                 const uint8_t* rowPtr = inBytePtr + srcY * inStride;
-                for (int c = 0; c < curW; ++c) {
+                for (int c = 0; c < targetTileW; ++c) {
                     int srcX = startX + c;
                     const uint8_t* px = rowPtr + srcX * 4;
-                    int dstOffset = r * curW + c;
-                    hData[0 * planeSize + dstOffset] = px[0] / 255.0f; // R
-                    hData[1 * planeSize + dstOffset] = px[1] / 255.0f; // G
-                    hData[2 * planeSize + dstOffset] = px[2] / 255.0f; // B
+                    int dstOffset = r * targetTileW + c;
+                    hData[0 * planeSize + dstOffset] = px[0] * (1.0f / 255.0f); // R
+                    hData[1 * planeSize + dstOffset] = px[1] * (1.0f / 255.0f); // G
+                    hData[2 * planeSize + dstOffset] = px[2] * (1.0f / 255.0f); // B
                 }
             }
             inputTensor->copyFromHostTensor(hostInput.get());
+            auto tPrepEnd = std::chrono::steady_clock::now();
+            totalPrepNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(tPrepEnd - tPrepStart).count();
 
             // Run inference
             auto tTileStart = std::chrono::steady_clock::now();
@@ -1306,86 +1372,91 @@ Java_com_example_InferenceEngine_nativeProcessWithMNN(
             if (tileInferNanos > maxInferNanos) maxInferNanos = tileInferNanos;
             inferCount++;
 
-            // Get output
-            MNN::Tensor* outTensor = interpreter->getSessionOutput(session, nullptr);
-            if (!outTensor) {
-                LOGE("nativeProcessWithMNN: getSessionOutput returned null");
-                failed = true;
-                break;
-            }
-            std::unique_ptr<MNN::Tensor> hostOutput(new MNN::Tensor(outTensor, MNN::Tensor::CAFFE));
+            // Output postprocessing & tile stitching
+            auto tStitchStart = std::chrono::steady_clock::now();
             outTensor->copyToHostTensor(hostOutput.get());
 
-            int outCurW = curW * aiScale;
-            int outCurH = curH * aiScale;
-            int cropStartX = (x - startX) * aiScale;
-            int cropStartY = (y - startY) * aiScale;
-            int cropW4x = std::min(tileSize, inW - x) * aiScale;
-            int cropH4x = std::min(tileSize, inH - y) * aiScale;
+            int modelScale = 4;
+            int outTileW = targetTileW * modelScale;
+            int outTileH = targetTileH * modelScale;
+            int cropStartX = offsetInTileX * modelScale;
+            int cropStartY = offsetInTileY * modelScale;
 
             const float* outData = hostOutput->host<float>();
-            int outPlaneSize = outCurH * outCurW;
+            int outPlaneSize = outTileH * outTileW;
 
-            if (requestedScale == 2) {
-                // Directly convert bounded 4x AI output region to corresponding 2x region
-                int cropW2x = cropW4x / 2;
-                int cropH2x = cropH4x / 2;
-                for (int r = 0; r < cropH2x; ++r) {
-                    int sY0 = cropStartY + r * 2;
-                    int sY1 = std::min(outCurH - 1, sY0 + 1);
-                    int dY = (y * 2) + r;
-                    uint8_t* dstRow = outBytePtr + dY * outStride;
-
-                    for (int c = 0; c < cropW2x; ++c) {
-                        int sX0 = cropStartX + c * 2;
-                        int sX1 = std::min(outCurW - 1, sX0 + 1);
-
-                        int off00 = sY0 * outCurW + sX0;
-                        int off01 = sY0 * outCurW + sX1;
-                        int off10 = sY1 * outCurW + sX0;
-                        int off11 = sY1 * outCurW + sX1;
-
-                        float rVal = (outData[0 * outPlaneSize + off00] + outData[0 * outPlaneSize + off01] +
-                                      outData[0 * outPlaneSize + off10] + outData[0 * outPlaneSize + off11]) * 0.25f * 255.0f;
-                        float gVal = (outData[1 * outPlaneSize + off00] + outData[1 * outPlaneSize + off01] +
-                                      outData[1 * outPlaneSize + off10] + outData[1 * outPlaneSize + off11]) * 0.25f * 255.0f;
-                        float bVal = (outData[2 * outPlaneSize + off00] + outData[2 * outPlaneSize + off01] +
-                                      outData[2 * outPlaneSize + off10] + outData[2 * outPlaneSize + off11]) * 0.25f * 255.0f;
-
-                        int dX = (x * 2) + c;
-                        uint8_t* dstPx = dstRow + dX * 4;
-
-                        dstPx[0] = static_cast<uint8_t>(std::clamp(rVal, 0.0f, 255.0f));
-                        dstPx[1] = static_cast<uint8_t>(std::clamp(gVal, 0.0f, 255.0f));
-                        dstPx[2] = static_cast<uint8_t>(std::clamp(bVal, 0.0f, 255.0f));
-                        dstPx[3] = 255;
-                    }
-                }
-            } else {
-                // Write into outBytePtr at 4x (RGBA_8888)
-                for (int r = 0; r < cropH4x; ++r) {
+            if (scale == 4) {
+                int cropW = validW * 4;
+                int cropH = validH * 4;
+                for (int r = 0; r < cropH; ++r) {
                     int sY = cropStartY + r;
-                    int dY = (y * 4) + r;
+                    int dY = (validStartY * 4) + r;
                     uint8_t* dstRow = outBytePtr + dY * outStride;
 
-                    for (int c = 0; c < cropW4x; ++c) {
+                    for (int c = 0; c < cropW; ++c) {
                         int sX = cropStartX + c;
-                        int sOffset = sY * outCurW + sX;
+                        int sOffset = sY * outTileW + sX;
 
                         float rVal = outData[0 * outPlaneSize + sOffset] * 255.0f;
                         float gVal = outData[1 * outPlaneSize + sOffset] * 255.0f;
                         float bVal = outData[2 * outPlaneSize + sOffset] * 255.0f;
 
-                        int dX = (x * 4) + c;
+                        int dX = (validStartX * 4) + c;
                         uint8_t* dstPx = dstRow + dX * 4;
 
                         dstPx[0] = static_cast<uint8_t>(std::clamp(rVal, 0.0f, 255.0f));
                         dstPx[1] = static_cast<uint8_t>(std::clamp(gVal, 0.0f, 255.0f));
                         dstPx[2] = static_cast<uint8_t>(std::clamp(bVal, 0.0f, 255.0f));
-                        dstPx[3] = 255;
+
+                        int srcPixX = validStartX + c / 4;
+                        int srcPixY = validStartY + r / 4;
+                        const uint8_t* inPx = inBytePtr + srcPixY * inStride + srcPixX * 4;
+                        dstPx[3] = inPx[3];
+                    }
+                }
+            } else {
+                int cropW = validW * 2;
+                int cropH = validH * 2;
+                for (int r = 0; r < cropH; ++r) {
+                    int sY0 = cropStartY + r * 2;
+                    int sY1 = std::min(cropStartY + r * 2 + 1, outTileH - 1);
+                    int dY = (validStartY * 2) + r;
+                    uint8_t* dstRow = outBytePtr + dY * outStride;
+
+                    for (int c = 0; c < cropW; ++c) {
+                        int sX0 = cropStartX + c * 2;
+                        int sX1 = std::min(cropStartX + c * 2 + 1, outTileW - 1);
+
+                        float rAvg = (outData[0 * outPlaneSize + sY0 * outTileW + sX0] +
+                                      outData[0 * outPlaneSize + sY0 * outTileW + sX1] +
+                                      outData[0 * outPlaneSize + sY1 * outTileW + sX0] +
+                                      outData[0 * outPlaneSize + sY1 * outTileW + sX1]) * 0.25f * 255.0f;
+                        float gAvg = (outData[1 * outPlaneSize + sY0 * outTileW + sX0] +
+                                      outData[1 * outPlaneSize + sY0 * outTileW + sX1] +
+                                      outData[1 * outPlaneSize + sY1 * outTileW + sX0] +
+                                      outData[1 * outPlaneSize + sY1 * outTileW + sX1]) * 0.25f * 255.0f;
+                        float bAvg = (outData[2 * outPlaneSize + sY0 * outTileW + sX0] +
+                                      outData[2 * outPlaneSize + sY0 * outTileW + sX1] +
+                                      outData[2 * outPlaneSize + sY1 * outTileW + sX0] +
+                                      outData[2 * outPlaneSize + sY1 * outTileW + sX1]) * 0.25f * 255.0f;
+
+                        int dX = (validStartX * 2) + c;
+                        uint8_t* dstPx = dstRow + dX * 4;
+
+                        dstPx[0] = static_cast<uint8_t>(std::clamp(rAvg, 0.0f, 255.0f));
+                        dstPx[1] = static_cast<uint8_t>(std::clamp(gAvg, 0.0f, 255.0f));
+                        dstPx[2] = static_cast<uint8_t>(std::clamp(bAvg, 0.0f, 255.0f));
+
+                        int srcPixX = validStartX + c / 2;
+                        int srcPixY = validStartY + r / 2;
+                        const uint8_t* inPx = inBytePtr + srcPixY * inStride + srcPixX * 4;
+                        dstPx[3] = inPx[3];
                     }
                 }
             }
+
+            auto tStitchEnd = std::chrono::steady_clock::now();
+            totalStitchNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(tStitchEnd - tStitchStart).count();
 
             tilesProcessed++;
             if (jProgressListener && onProgressMethod) {
@@ -1397,434 +1468,40 @@ Java_com_example_InferenceEngine_nativeProcessWithMNN(
 
     AndroidBitmap_unlockPixels(env, jOutputBitmap);
     AndroidBitmap_unlockPixels(env, jInputBitmap);
-    interpreter->releaseSession(session);
 
     if (cancelled) {
         return -2;
     }
     if (failed) {
+        if (g_prod_state.interpreter && g_prod_state.session) {
+            g_prod_state.interpreter->releaseSession(g_prod_state.session);
+        }
+        g_prod_state.session = nullptr;
+        g_prod_state.interpreter.reset();
+        g_prod_state.modelPath.clear();
+        g_prod_state.backendType = -1;
+        g_prod_state.lastTensorW = -1;
+        g_prod_state.lastTensorH = -1;
         return 2;
     }
 
-    // Populate metrics if array provided
-    if (jMetricsOut && env->GetArrayLength(jMetricsOut) >= 5) {
-        jlong m[5];
-        m[0] = sessionInitNanos;
-        m[1] = totalInferNanos;
-        m[2] = (inferCount > 0 ? minInferNanos : 0);
-        m[3] = (inferCount > 0 ? maxInferNanos : 0);
-        m[4] = inferCount;
-        env->SetLongArrayRegion(jMetricsOut, 0, 5, m);
+    // Populate full telemetry metrics if array provided
+    if (jMetricsOut) {
+        jsize len = env->GetArrayLength(jMetricsOut);
+        std::vector<jlong> m(len, 0);
+        if (len >= 1) m[0] = sessionInitNanos;
+        if (len >= 2) m[1] = totalInferNanos;
+        if (len >= 3) m[2] = (inferCount > 0 ? minInferNanos : 0);
+        if (len >= 4) m[3] = (inferCount > 0 ? maxInferNanos : 0);
+        if (len >= 5) m[4] = inferCount;
+        if (len >= 6) m[5] = totalPrepNanos;
+        if (len >= 7) m[6] = totalStitchNanos;
+        if (len >= 8) m[7] = sessionReused ? 1L : 0L;
+        if (len >= 9) m[8] = totalTiles;
+        if (len >= 10) m[9] = targetTileW;
+        env->SetLongArrayRegion(jMetricsOut, 0, len, m.data());
     }
 
-    return 0;
-}
-
-struct ProductionSessionState {
-    std::shared_ptr<MNN::Interpreter> interpreter;
-    MNN::Session* session = nullptr;
-    std::string modelPath;
-    int backendType = -1;
-    std::mutex mtx;
-};
-static ProductionSessionState g_prod_state;
-
-JNIEXPORT jint JNICALL
-Java_com_example_InferenceEngine_nativeProcessToSinkMNN(
-    JNIEnv* env,
-    jobject /* thiz */,
-    jstring jModelPath,
-    jobject jInputBitmap,
-    jobject jSink,
-    jint requestedScale,
-    jint requestedTileSize,
-    jint backendType,
-    jobject jProgressListener,
-    jlongArray jMetricsOut
-) {
-    if (!jModelPath || !jInputBitmap || !jSink) {
-        LOGE("nativeProcessToSinkMNN: invalid null arguments");
-        return -1;
-    }
-    if (requestedScale != 2 && requestedScale != 4) {
-        LOGE("nativeProcessToSinkMNN: requestedScale must be 2 or 4 (got %d)", requestedScale);
-        return -1;
-    }
-
-    // Get direct raw file path from the sink
-    jclass sinkClass = env->GetObjectClass(jSink);
-    if (!sinkClass) return 3;
-
-    jmethodID getRawFilePathMethod = env->GetMethodID(sinkClass, "getRawFilePath", "()Ljava/lang/String;");
-    if (!getRawFilePathMethod) {
-        LOGE("nativeProcessToSinkMNN: cannot find getRawFilePath method on sink");
-        return 3;
-    }
-
-    jstring jRawPath = (jstring)env->CallObjectMethod(jSink, getRawFilePathMethod);
-    if (!jRawPath) {
-        LOGE("nativeProcessToSinkMNN: getRawFilePath returned null");
-        return 3;
-    }
-    const char* rawPathStr = env->GetStringUTFChars(jRawPath, nullptr);
-    int fd = open(rawPathStr, O_WRONLY | O_CREAT, 0666);
-    env->ReleaseStringUTFChars(jRawPath, rawPathStr);
-    env->DeleteLocalRef(jRawPath);
-
-    if (fd < 0) {
-        LOGE("nativeProcessToSinkMNN: Failed to open raw output file directly in C++");
-        return 5;
-    }
-
-    const char* pathStr = env->GetStringUTFChars(jModelPath, nullptr);
-    std::string modelPath(pathStr);
-    env->ReleaseStringUTFChars(jModelPath, pathStr);
-
-    AndroidBitmapInfo inInfo;
-    if (AndroidBitmap_getInfo(env, jInputBitmap, &inInfo) < 0 || inInfo.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
-        LOGE("nativeProcessToSinkMNN: invalid input bitmap format");
-        close(fd);
-        return 3;
-    }
-
-    int inW = inInfo.width;
-    int inH = inInfo.height;
-
-    std::shared_ptr<MNN::Interpreter> interpreter;
-    MNN::Session* session = nullptr;
-    int64_t sessionInitNanos = 0;
-
-    {
-        std::lock_guard<std::mutex> lock(g_prod_state.mtx);
-        auto tInitStart = std::chrono::steady_clock::now();
-
-        if (g_prod_state.interpreter && (g_prod_state.modelPath != modelPath || g_prod_state.backendType != backendType)) {
-            if (g_prod_state.session) {
-                g_prod_state.interpreter->releaseSession(g_prod_state.session);
-                g_prod_state.session = nullptr;
-            }
-            g_prod_state.interpreter.reset();
-            g_prod_state.modelPath.clear();
-            g_prod_state.backendType = -1;
-        }
-
-        if (!g_prod_state.interpreter || !g_prod_state.session) {
-            g_prod_state.interpreter = std::shared_ptr<MNN::Interpreter>(MNN::Interpreter::createFromFile(modelPath.c_str()));
-            if (!g_prod_state.interpreter) {
-                LOGE("nativeProcessToSinkMNN: failed to create interpreter");
-                close(fd);
-                return 4;
-            }
-
-            // BYPASS CORRUPTED CACHE
-            g_prod_state.interpreter->setCacheFile(".mnn_vulkan_safe_cache");
-
-            MNN::ScheduleConfig config;
-            config.type = (backendType == 0) ? MNN_FORWARD_VULKAN : MNN_FORWARD_CPU;
-            config.numThread = 4;
-            if (backendType == 0) {
-                config.mode = MNN_GPU_TUNING_NONE; // REVERTED HANG CULPRIT
-            }
-
-            MNN::BackendConfig backendConfig;
-            backendConfig.precision = MNN::BackendConfig::Precision_Normal; // REVERTED DRIVER CRASH CULPRIT
-            config.backendConfig = &backendConfig;
-
-            g_prod_state.session = g_prod_state.interpreter->createSession(config);
-            if (!g_prod_state.session) {
-                LOGE("nativeProcessToSinkMNN: failed to create session");
-                g_prod_state.interpreter.reset();
-                close(fd);
-                return 1;
-            }
-
-            if (backendType == 0) {
-                int backends[4] = {-1, -1, -1, -1};
-                g_prod_state.interpreter->getSessionInfo(g_prod_state.session, MNN::Interpreter::BACKENDS, backends);
-                if (backends[0] != MNN_FORWARD_VULKAN) {
-                    LOGW("nativeProcessToSinkMNN: Vulkan session fell back to %d; rejecting", backends[0]);
-                    g_prod_state.interpreter->releaseSession(g_prod_state.session);
-                    g_prod_state.session = nullptr;
-                    g_prod_state.interpreter.reset();
-                    close(fd);
-                    return 1;
-                }
-            }
-
-            g_prod_state.modelPath = modelPath;
-            g_prod_state.backendType = backendType;
-        }
-
-        interpreter = g_prod_state.interpreter;
-        session = g_prod_state.session;
-
-        auto tInitEnd = std::chrono::steady_clock::now();
-        sessionInitNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(tInitEnd - tInitStart).count();
-    }
-
-    void* inPixels = nullptr;
-    if (AndroidBitmap_lockPixels(env, jInputBitmap, &inPixels) < 0 || !inPixels) {
-        LOGE("nativeProcessToSinkMNN: failed to lock input pixels");
-        close(fd);
-        return 3;
-    }
-
-    jmethodID onProgressMethod = nullptr;
-    if (jProgressListener) {
-        jclass listenerClass = env->GetObjectClass(jProgressListener);
-        if (listenerClass) onProgressMethod = env->GetMethodID(listenerClass, "onProgress", "(F)V");
-    }
-
-    jclass threadClass = env->FindClass("java/lang/Thread");
-    jmethodID currentThreadMethod = env->GetStaticMethodID(threadClass, "currentThread", "()Ljava/lang/Thread;");
-    jmethodID isInterruptedMethod = env->GetMethodID(threadClass, "isInterrupted", "()Z");
-    jobject currentThread = env->CallStaticObjectMethod(threadClass, currentThreadMethod);
-
-    // ==========================================
-    // DYNAMIC TILE SIZE UNLOCKING (Phase B1)
-    // ==========================================
-    int tileSize = (requestedTileSize >= 64 && requestedTileSize <= 512) ? requestedTileSize : 256;
-    int pad = 8;
-    int totalTiles = ((inW + tileSize - 1) / tileSize) * ((inH + tileSize - 1) / tileSize);
-    int tilesProcessed = 0;
-    int64_t totalInferNanos = 0;
-    int64_t totalPrepNanos = 0;
-    int64_t totalPostNanos = 0;
-    int64_t totalWriteNanos = 0;
-    int64_t minInferNanos = std::numeric_limits<int64_t>::max();
-    int64_t maxInferNanos = 0;
-    int inferCount = 0;
-
-    uint8_t* inBytePtr = static_cast<uint8_t*>(inPixels);
-    int inStride = inInfo.stride;
-    bool failed = false;
-    bool cancelled = false;
-    int lastTensorW = -1;
-    int lastTensorH = -1;
-
-    for (int y = 0; y < inH && !failed && !cancelled; y += tileSize) {
-        for (int x = 0; x < inW && !failed && !cancelled; x += tileSize) {
-            if (currentThread && isInterruptedMethod && env->CallBooleanMethod(currentThread, isInterruptedMethod)) {
-                cancelled = true;
-                break;
-            }
-
-            int startX = std::max(0, x - pad);
-            int startY = std::max(0, y - pad);
-            int endX = std::min(inW, x + tileSize + pad);
-            int endY = std::min(inH, y + tileSize + pad);
-            int curW = endX - startX;
-            int curH = endY - startY;
-
-            MNN::Tensor* inputTensor = interpreter->getSessionInput(session, nullptr);
-            if (!inputTensor) { failed = true; break; }
-
-            if (curW != lastTensorW || curH != lastTensorH) {
-                interpreter->resizeTensor(inputTensor, {1, 3, curH, curW});
-                interpreter->resizeSession(session);
-                lastTensorW = curW;
-                lastTensorH = curH;
-            }
-
-            inputTensor = interpreter->getSessionInput(session, nullptr);
-            std::unique_ptr<MNN::Tensor> hostInput(new MNN::Tensor(inputTensor, MNN::Tensor::CAFFE));
-            float* hData = hostInput->host<float>();
-            int planeSize = curH * curW;
-
-            auto tPrepStart = std::chrono::steady_clock::now();
-            for (int r = 0; r < curH; ++r) {
-                const uint8_t* rowPtr = inBytePtr + (startY + r) * inStride;
-                for (int c = 0; c < curW; ++c) {
-                    const uint8_t* px = rowPtr + (startX + c) * 4;
-                    int dstOffset = r * curW + c;
-                    hData[0 * planeSize + dstOffset] = px[0] / 255.0f;
-                    hData[1 * planeSize + dstOffset] = px[1] / 255.0f;
-                    hData[2 * planeSize + dstOffset] = px[2] / 255.0f;
-                }
-            }
-            inputTensor->copyFromHostTensor(hostInput.get());
-            auto tPrepEnd = std::chrono::steady_clock::now();
-            totalPrepNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(tPrepEnd - tPrepStart).count();
-
-            auto tTileStart = std::chrono::steady_clock::now();
-            MNN::ErrorCode err = interpreter->runSession(session);
-            auto tTileEnd = std::chrono::steady_clock::now();
-
-            if (err != MNN::NO_ERROR) { failed = true; break; }
-
-            int64_t tileInferNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(tTileEnd - tTileStart).count();
-            totalInferNanos += tileInferNanos;
-            if (tileInferNanos < minInferNanos) minInferNanos = tileInferNanos;
-            if (tileInferNanos > maxInferNanos) maxInferNanos = tileInferNanos;
-            inferCount++;
-
-            MNN::Tensor* outTensor = interpreter->getSessionOutput(session, nullptr);
-            if (!outTensor) { failed = true; break; }
-            std::unique_ptr<MNN::Tensor> hostOutput(new MNN::Tensor(outTensor, MNN::Tensor::CAFFE));
-            outTensor->copyToHostTensor(hostOutput.get());
-
-            int aiScale = 4;
-            int outCurW = curW * aiScale;
-            int outCurH = curH * aiScale;
-            int cropStartX = (x - startX) * aiScale;
-            int cropStartY = (y - startY) * aiScale;
-            int cropW4x = std::min(tileSize, inW - x) * aiScale;
-            int cropH4x = std::min(tileSize, inH - y) * aiScale;
-            const float* outData = hostOutput->host<float>();
-            int outPlaneSize = outCurH * outCurW;
-
-            if (requestedScale == 2) {
-                int cropW2x = cropW4x / 2;
-                int cropH2x = cropH4x / 2;
-
-                // Allocate a single contiguous buffer for the entire tile
-                std::vector<uint8_t> tileBuffer(cropW2x * cropH2x * 4);
-                std::vector<struct iovec> iov(cropH2x);
-
-                auto tPostStart = std::chrono::steady_clock::now();
-                for (int r = 0; r < cropH2x; ++r) {
-                    int dY = (y * 2) + r;
-                    int sY0 = cropStartY + r * 2;
-                    int sY1 = std::min(outCurH - 1, sY0 + 1);
-
-                    uint8_t* rowDest = tileBuffer.data() + (r * cropW2x * 4);
-
-                    for (int c = 0; c < cropW2x; ++c) {
-                        int sX0 = cropStartX + c * 2;
-                        int sX1 = std::min(outCurW - 1, sX0 + 1);
-
-                        int off00 = sY0 * outCurW + sX0;
-                        int off01 = sY0 * outCurW + sX1;
-                        int off10 = sY1 * outCurW + sX0;
-                        int off11 = sY1 * outCurW + sX1;
-
-                        float rVal = (outData[0 * outPlaneSize + off00] + outData[0 * outPlaneSize + off01] + outData[0 * outPlaneSize + off10] + outData[0 * outPlaneSize + off11]) * 0.25f * 255.0f;
-                        float gVal = (outData[1 * outPlaneSize + off00] + outData[1 * outPlaneSize + off01] + outData[1 * outPlaneSize + off10] + outData[1 * outPlaneSize + off11]) * 0.25f * 255.0f;
-                        float bVal = (outData[2 * outPlaneSize + off00] + outData[2 * outPlaneSize + off01] + outData[2 * outPlaneSize + off10] + outData[2 * outPlaneSize + off11]) * 0.25f * 255.0f;
-
-                        int inPixelY = std::min(std::max(0, (y + r / 2) - startY), curH - 1);
-                        int inPixelX = std::min(std::max(0, (x + c / 2) - startX), curW - 1);
-                        const uint8_t* inPx = inBytePtr + (startY + inPixelY) * inStride + (startX + inPixelX) * 4;
-                        uint8_t aVal = inPx[3];
-
-                        uint8_t fR = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, rVal)));
-                        uint8_t fG = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, gVal)));
-                        uint8_t fB = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, bVal)));
-
-                        int dstIdx = c * 4;
-                        rowDest[dstIdx + 0] = fR;
-                        rowDest[dstIdx + 1] = fG;
-                        rowDest[dstIdx + 2] = fB;
-                        rowDest[dstIdx + 3] = aVal;
-                    }
-
-                    iov[r].iov_base = rowDest;
-                    iov[r].iov_len = cropW2x * 4;
-                }
-                auto tPostEnd = std::chrono::steady_clock::now();
-                totalPostNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(tPostEnd - tPostStart).count();
-
-                off_t baseOffset = static_cast<off_t>(y * 2) * (inW * 2) * 4 + static_cast<off_t>(x * 2) * 4;
-                auto tWriteStart = std::chrono::steady_clock::now();
-                for (int r = 0; r < cropH2x; ++r) {
-                    off_t rowOffset = baseOffset + static_cast<off_t>(r) * (inW * 2) * 4;
-                    ssize_t expected = cropW2x * 4;
-                    ssize_t written = pwrite(fd, iov[r].iov_base, expected, rowOffset);
-                    if (written != expected) {
-                        failed = true;
-                        break;
-                    }
-                }
-                auto tWriteEnd = std::chrono::steady_clock::now();
-                totalWriteNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(tWriteEnd - tWriteStart).count();
-                if (failed) break;
-            } else {
-                std::vector<uint8_t> tileBuffer(cropW4x * cropH4x * 4);
-                std::vector<struct iovec> iov(cropH4x);
-
-                auto tPostStart = std::chrono::steady_clock::now();
-                for (int r = 0; r < cropH4x; ++r) {
-                    int dY = (y * 4) + r;
-                    int sY = cropStartY + r;
-
-                    uint8_t* rowDest = tileBuffer.data() + (r * cropW4x * 4);
-
-                    for (int c = 0; c < cropW4x; ++c) {
-                        int sX = cropStartX + c;
-                        int sOffset = sY * outCurW + sX;
-
-                        float rVal = outData[0 * outPlaneSize + sOffset] * 255.0f;
-                        float gVal = outData[1 * outPlaneSize + sOffset] * 255.0f;
-                        float bVal = outData[2 * outPlaneSize + sOffset] * 255.0f;
-
-                        int inPixelY = std::min(std::max(0, (y + r / 4) - startY), curH - 1);
-                        int inPixelX = std::min(std::max(0, (x + c / 4) - startX), curW - 1);
-                        const uint8_t* inPx = inBytePtr + (startY + inPixelY) * inStride + (startX + inPixelX) * 4;
-                        uint8_t aVal = inPx[3];
-
-                        uint8_t fR = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, rVal)));
-                        uint8_t fG = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, gVal)));
-                        uint8_t fB = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, bVal)));
-
-                        int dstIdx = c * 4;
-                        rowDest[dstIdx + 0] = fR;
-                        rowDest[dstIdx + 1] = fG;
-                        rowDest[dstIdx + 2] = fB;
-                        rowDest[dstIdx + 3] = aVal;
-                    }
-
-                    iov[r].iov_base = rowDest;
-                    iov[r].iov_len = cropW4x * 4;
-                }
-                auto tPostEnd = std::chrono::steady_clock::now();
-                totalPostNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(tPostEnd - tPostStart).count();
-
-                off_t baseOffset = static_cast<off_t>(y * 4) * (inW * 4) * 4 + static_cast<off_t>(x * 4) * 4;
-                auto tWriteStart = std::chrono::steady_clock::now();
-                for (int r = 0; r < cropH4x; ++r) {
-                    off_t rowOffset = baseOffset + static_cast<off_t>(r) * (inW * 4) * 4;
-                    ssize_t expected = cropW4x * 4;
-                    ssize_t written = pwrite(fd, iov[r].iov_base, expected, rowOffset);
-                    if (written != expected) {
-                        failed = true;
-                        break;
-                    }
-                }
-                auto tWriteEnd = std::chrono::steady_clock::now();
-                totalWriteNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(tWriteEnd - tWriteStart).count();
-                if (failed) break;
-            }
-
-            tilesProcessed++;
-            if (jProgressListener && onProgressMethod) {
-                float fraction = static_cast<float>(tilesProcessed) / static_cast<float>(totalTiles);
-                env->CallVoidMethod(jProgressListener, onProgressMethod, fraction);
-                if (env->ExceptionCheck()) {
-                    env->ExceptionClear();
-                    failed = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    AndroidBitmap_unlockPixels(env, jInputBitmap);
-    close(fd);
-
-    if (cancelled) return -2;
-    if (failed) return 2;
-
-    LOGI("Phase A1 Metrics - Prep: %.2f ms, Infer: %.2f ms, Post: %.2f ms, Write: %.2f ms",
-         totalPrepNanos / 1000000.0,
-         totalInferNanos / 1000000.0,
-         totalPostNanos / 1000000.0,
-         totalWriteNanos / 1000000.0);
-
-    if (jMetricsOut && env->GetArrayLength(jMetricsOut) >= 5) {
-        jlong m[5];
-        m[0] = sessionInitNanos; m[1] = totalInferNanos; m[2] = (inferCount > 0 ? minInferNanos : 0); m[3] = (inferCount > 0 ? maxInferNanos : 0); m[4] = inferCount;
-        env->SetLongArrayRegion(jMetricsOut, 0, 5, m);
-    }
     return 0;
 }
 

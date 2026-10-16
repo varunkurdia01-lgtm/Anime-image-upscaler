@@ -19,3 +19,19 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# JNI native method preservation
+-keepclasseswithmembernames class * {
+    native <methods>;
+}
+
+# Keep JNI-invoked engine classes, interfaces, and MNN wrappers
+-keep class com.example.InferenceEngine { *; }
+-keep interface com.example.InferenceEngine$NativeProgressListener { *; }
+-keep class com.example.MNNBenchmark { *; }
+
+# Keep ONNX runtime classes
+-keep class ai.onnxruntime.** { *; }
+
+# Keep Room database entities, DAOs, and database classes
+-keep class com.example.data.** { *; }

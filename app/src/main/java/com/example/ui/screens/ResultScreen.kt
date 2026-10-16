@@ -32,26 +32,13 @@ import com.example.ui.components.ceramicInnerShadow
 import com.example.ui.components.ceramicShadow
 import com.example.ui.components.tactileClick
 import com.example.ui.theme.*
-import androidx.activity.compose.BackHandler
 import com.example.AppViewModel
 import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 
-import androidx.compose.ui.semantics.ProgressBarRangeInfo
-import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.progressBarRangeInfo
-import androidx.compose.ui.semantics.role
-import androidx.compose.ui.semantics.selected
-import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.semantics.setProgress
-
 @Composable
 fun ResultScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit, onUpscaleAnother: () -> Unit) {
-    BackHandler {
-        onBack()
-    }
-
+    androidx.activity.compose.BackHandler { onBack() }
     val context = LocalContext.current
     val resultBitmap by viewModel.resultBitmap.collectAsState()
     val selectedImages by viewModel.selectedImages.collectAsState()
@@ -60,17 +47,8 @@ fun ResultScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit, onUpsc
     val selectedIndex by viewModel.selectedResultIndex.collectAsState()
     val saveState by viewModel.saveState.collectAsState()
     val itemSaveStatuses by viewModel.itemSaveStatuses.collectAsState()
-    var showMoreMenu by remember { mutableStateOf(false) }
 
-    LaunchedEffect(selectedImages, batchResults, batchItems) {
-        val hasAnySuccess = batchItems.any { it.status == com.example.BatchItemStatus.Success } || batchResults.isNotEmpty() || resultBitmap != null
-        if (!hasAnySuccess && selectedImages.isEmpty()) {
-            onBack()
-        }
-    }
-
-    val currentBatchItem = batchItems.getOrNull(selectedIndex)
-    val currentItem = currentBatchItem?.processedItem ?: batchResults.getOrNull(selectedIndex)
+    val currentItem = batchItems.getOrNull(selectedIndex)?.processedItem ?: batchResults.getOrNull(selectedIndex)
     val currentOriginalUri = currentItem?.originalUri
         ?: selectedImages.getOrNull(selectedIndex)
         ?: selectedImages.firstOrNull()
@@ -115,8 +93,12 @@ fun ResultScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit, onUpsc
             }
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(text = "Result", style = MaterialTheme.typography.headlineSmall, color = OnSurface)
-                val headerScaleText = if (scaleIndex == 0) "2× PRECISION" else "4× ULTRA CLARITY"
-                Text(text = headerScaleText, style = MaterialTheme.typography.labelSmall, color = Primary, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
+                Text(
+                    text = if (scaleIndex == 0) "2× PRECISION" else "4× ULTRA CLARITY",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Primary,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Bold
+                )
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 IconButton(
@@ -128,6 +110,7 @@ fun ResultScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit, onUpsc
                 ) {
                     Icon(imageVector = Icons.Outlined.Share, contentDescription = "Share", tint = OnSurfaceVariant, modifier = Modifier.size(18.dp))
                 }
+                var showMoreMenu by remember { mutableStateOf(false) }
                 Box {
                     IconButton(
                         onClick = { showMoreMenu = true },
@@ -136,7 +119,7 @@ fun ResultScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit, onUpsc
                             .ceramicShadow(cornerRadius = 20.dp, offsetX = 2.dp, offsetY = 2.dp, blurRadius = 8.dp)
                             .background(SurfaceContainerLow, CircleShape)
                     ) {
-                        Icon(imageVector = Icons.Outlined.MoreVert, contentDescription = "More options", tint = OnSurfaceVariant)
+                        Icon(imageVector = Icons.Outlined.MoreVert, contentDescription = "More", tint = OnSurfaceVariant)
                     }
                     DropdownMenu(
                         expanded = showMoreMenu,
@@ -149,7 +132,7 @@ fun ResultScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit, onUpsc
                                 viewModel.saveToGallery(context)
                             },
                             leadingIcon = {
-                                Icon(Icons.Outlined.Download, contentDescription = null)
+                                Icon(Icons.Outlined.DownloadDone, contentDescription = null)
                             }
                         )
                         DropdownMenuItem(
@@ -191,8 +174,7 @@ fun ResultScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit, onUpsc
             ) {
                 val maxWidthPx = with(LocalDensity.current) { maxWidth.toPx() }
                 var dragFraction by remember { mutableFloatStateOf(0.5f) }
-                val currentFraction = dragFraction.coerceIn(0f, 1f)
-                val offsetX = currentFraction * maxWidthPx
+                val offsetX = dragFraction * maxWidthPx
 
                 // After Image (Base)
                 if (resultBitmap != null) {
@@ -218,7 +200,7 @@ fun ResultScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit, onUpsc
                 Box(
                     modifier = Modifier
                         .fillMaxHeight()
-                        .fillMaxWidth(currentFraction)
+                        .fillMaxWidth(dragFraction)
                         .clip(RoundedCornerShape(topStart = 22.dp, bottomStart = 22.dp))
                 ) {
                     AsyncImage(
@@ -230,6 +212,7 @@ fun ResultScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit, onUpsc
                         contentScale = ContentScale.Crop,
                         modifier = Modifier
                             .fillMaxHeight()
+                            // To prevent image squishing, we size it to the parent's full width and crop it via the parent box
                             .width(this@BoxWithConstraints.maxWidth)
                     )
                 }
@@ -265,20 +248,11 @@ fun ResultScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit, onUpsc
                     modifier = Modifier
                         .fillMaxHeight()
                         .offset { IntOffset(offsetX.roundToInt() - 18.dp.roundToPx(), 0) }
-                        .semantics {
-                            role = Role.Image
-                            progressBarRangeInfo = ProgressBarRangeInfo(current = currentFraction, range = 0f..1f)
-                            contentDescription = "Before and after comparison slider, ${(currentFraction * 100).toInt()}% split"
-                            setProgress { targetValue ->
-                                dragFraction = targetValue.coerceIn(0f, 1f)
-                                true
-                            }
-                        }
-                        .pointerInput(Unit) {
+                        .pointerInput(maxWidthPx) {
                             detectDragGestures { change, dragAmount ->
                                 change.consume()
-                                if (maxWidthPx > 0) {
-                                    dragFraction = ((dragFraction * maxWidthPx + dragAmount.x) / maxWidthPx).coerceIn(0f, 1f)
+                                if (maxWidthPx > 0f) {
+                                    dragFraction = (dragFraction + dragAmount.x / maxWidthPx).coerceIn(0f, 1f)
                                 }
                             }
                         },
@@ -355,8 +329,14 @@ fun ResultScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit, onUpsc
                 style = MaterialTheme.typography.bodyMedium,
                 color = OnSurface
             )
-            val totalCount = if (selectedImages.isNotEmpty()) selectedImages.size else if (batchItems.isNotEmpty()) batchItems.size else batchResults.size
-            val completedCount = if (batchItems.isNotEmpty()) batchItems.count { it.status == com.example.BatchItemStatus.Success } else batchResults.size
+            val completedCount = if (batchItems.isNotEmpty()) {
+                batchItems.count { it.status == com.example.BatchItemStatus.Success }
+            } else if (batchResults.isNotEmpty()) {
+                batchResults.size
+            } else {
+                selectedImages.size
+            }
+            val totalCount = if (batchItems.isNotEmpty()) batchItems.size else selectedImages.size
             Text(
                 text = "$completedCount of $totalCount Completed",
                 style = MaterialTheme.typography.labelMedium,
@@ -372,21 +352,16 @@ fun ResultScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit, onUpsc
                 .horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            val batchImages = selectedImages
+            val batchImages = if (batchItems.isNotEmpty()) {
+                batchItems.map { it.originalUri }
+            } else {
+                selectedImages
+            }
             
             batchImages.forEachIndexed { index, url ->
                 val isSelected = index == selectedIndex
                 val bItem = batchItems.getOrNull(index)
-                val isSuccess = bItem?.status == com.example.BatchItemStatus.Success && bItem.processedItem != null
-                val isFailed = bItem?.status == com.example.BatchItemStatus.Failed
-                val isCancelled = bItem?.status == com.example.BatchItemStatus.Cancelled
-
-                val itemStatusDesc = when {
-                    isSuccess -> "Completed"
-                    isFailed -> "Failed"
-                    isCancelled -> "Cancelled"
-                    else -> "Processing"
-                }
+                val displayUri = bItem?.processedItem?.enhancedUri ?: url
                 Box(
                     modifier = Modifier
                         .size(64.dp)
@@ -397,15 +372,8 @@ fun ResultScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit, onUpsc
                         .then(
                             if (isSelected) Modifier.ceramicShadow(cornerRadius = 12.dp, offsetX = 2.dp, offsetY = 2.dp, blurRadius = 6.dp) else Modifier
                         )
-                        .semantics {
-                            selected = isSelected
-                            role = Role.Button
-                            contentDescription = "Batch item ${index + 1} of ${batchImages.size}, $itemStatusDesc, ${if (isSelected) "selected" else "not selected"}"
-                        }
-                        .tactileClick(role = Role.Button) {
-                            if (isSuccess) {
-                                viewModel.setSelectedResultIndex(index)
-                            }
+                        .tactileClick {
+                            viewModel.setSelectedResultIndex(index)
                         }
                 ) {
                     Box(modifier = Modifier
@@ -414,7 +382,7 @@ fun ResultScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit, onUpsc
                         .clip(RoundedCornerShape(10.dp))) {
                         AsyncImage(
                             model = ImageRequest.Builder(LocalContext.current)
-                                .data(bItem?.processedItem?.enhancedUri ?: url)
+                                .data(displayUri)
                                 .crossfade(true)
                                 .build(),
                             contentDescription = null,
@@ -428,32 +396,18 @@ fun ResultScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit, onUpsc
                                     .border(2.dp, Primary, RoundedCornerShape(10.dp))
                             )
                         }
-                        if (isFailed) {
+                        if (bItem?.status == com.example.BatchItemStatus.Failed || bItem?.status == com.example.BatchItemStatus.Cancelled) {
                             Box(
                                 modifier = Modifier
                                     .fillMaxSize()
-                                    .background(ErrorColor.copy(alpha = 0.45f)),
+                                    .background(Color.Black.copy(alpha = 0.55f)),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Icon(
-                                    imageVector = Icons.Outlined.ErrorOutline,
-                                    contentDescription = "Failed",
-                                    tint = OnPrimary,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                            }
-                        } else if (isCancelled) {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .background(Outline.copy(alpha = 0.45f)),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Outlined.Cancel,
-                                    contentDescription = "Cancelled",
-                                    tint = OnPrimary,
-                                    modifier = Modifier.size(18.dp)
+                                    imageVector = if (bItem.status == com.example.BatchItemStatus.Failed) Icons.Outlined.ErrorOutline else Icons.Outlined.Cancel,
+                                    contentDescription = null,
+                                    tint = if (bItem.status == com.example.BatchItemStatus.Failed) ErrorColor else OutlineVariant,
+                                    modifier = Modifier.size(20.dp)
                                 )
                             }
                         }

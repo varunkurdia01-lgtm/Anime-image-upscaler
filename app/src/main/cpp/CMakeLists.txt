@@ -5,6 +5,8 @@ project("MNNBenchmark" CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math -fvisibility=hidden")
+
 # Prebuilt MNN library from jniLibs
 add_library(mnn_prebuilt SHARED IMPORTED)
 set_target_properties(mnn_prebuilt PROPERTIES

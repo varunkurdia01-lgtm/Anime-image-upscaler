@@ -31,18 +31,23 @@ data class ProcessedItem(
     val height: Int
 )
 
+enum class BatchItemStatus { Waiting, Processing, Success, Failed, Cancelled }
+data class BatchItem(val originalUri: String, val status: BatchItemStatus = BatchItemStatus.Waiting, val processedItem: ProcessedItem? = null)
+enum class ResultOrigin { Processing, History }
+
 class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val inferenceEngine = InferenceEngine(application)
 
     private val prefs = application.getSharedPreferences("pixelboost_settings", Context.MODE_PRIVATE)
-
-        
 
     private val _themeIndex = MutableStateFlow(prefs.getInt("themeIndex", 0))
     val themeIndex = _themeIndex.asStateFlow()
     fun setThemeIndex(index: Int) {
         _themeIndex.value = index
         prefs.edit().putInt("themeIndex", index).apply()
+    }
+    fun setTheme(index: Int) {
+        setThemeIndex(index)
     }
     private val _scaleIndex = MutableStateFlow(prefs.getInt("scaleIndex", 1))
     val scaleIndex = _scaleIndex.asStateFlow()
@@ -72,14 +77,160 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         prefs.edit().putBoolean("saveEnhanced", save).apply()
     }
 
+    private val _manualOverride = MutableStateFlow(prefs.getString("manualBackendOverride", "AUTO") ?: "AUTO")
+    val manualOverride = _manualOverride.asStateFlow()
+
+    private val _calibratedWinner = MutableStateFlow(prefs.getString("calibratedWinner", "MNN_CPU") ?: "MNN_CPU")
+    val calibratedWinner = _calibratedWinner.asStateFlow()
+
+    private val _activeBackend = MutableStateFlow(
+        if (_manualOverride.value != "AUTO") _manualOverride.value else _calibratedWinner.value
+    )
+    val activeBackend = _activeBackend.asStateFlow()
+
+    private val _calibrationSummary = MutableStateFlow<CalibrationSummary?>(null)
+    val calibrationSummary = _calibrationSummary.asStateFlow()
+
+    private val _isCalibrating = MutableStateFlow(false)
+    val isCalibrating = _isCalibrating.asStateFlow()
+
+    fun setManualOverride(overrideChoice: String) {
+        _manualOverride.value = overrideChoice
+        prefs.edit().putString("manualBackendOverride", overrideChoice).apply()
+        val effective = if (overrideChoice != "AUTO") overrideChoice else _calibratedWinner.value
+        _activeBackend.value = effective
+        inferenceEngine.activeBackendOverride = effective
+    }
+
+    private fun getConfigurationFingerprint(scale: Int): String {
+        val deviceModel = android.os.Build.MODEL ?: "unknown"
+        val sdkInt = android.os.Build.VERSION.SDK_INT
+        val mnnModelFile = inferenceEngine.getModelFile("RealESRGAN_x4plus_anime_6B-x4.mnn")
+        val size = mnnModelFile?.length() ?: 0L
+        val mod = mnnModelFile?.lastModified() ?: 0L
+        val hw = inferenceEngine.queryHardwareProfile()
+        val tileSize = hw.recommendedTileSizeCpu
+        val pad = 8
+        val cpuThreads = hw.recommendedCpuThreads
+        val versionCode = 1
+        return "pb_v2_${deviceModel}_api${sdkInt}_scale${scale}_tile${tileSize}_pad${pad}_threads${cpuThreads}_size${size}_mod${mod}_v${versionCode}"
+    }
+
+    fun runHardwareCalibration(forceRefresh: Boolean = false, onComplete: ((CalibrationSummary) -> Unit)? = null) {
+        viewModelScope.launch {
+            _isCalibrating.value = true
+            try {
+                val scale = if (_scaleIndex.value == 0) 2 else 4
+                val fingerprint = getConfigurationFingerprint(scale)
+                val hw = inferenceEngine.queryHardwareProfile()
+                val summary = inferenceEngine.runHardwareCalibration(
+                    scale = scale,
+                    tileSize = hw.recommendedTileSizeCpu,
+                    pad = 8,
+                    forcedFingerprint = fingerprint
+                )
+                _calibrationSummary.value = summary
+                _calibratedWinner.value = summary.winningBackend
+                prefs.edit()
+                    .putString("calibratedWinner", summary.winningBackend)
+                    .putString("cachedFingerprint", fingerprint)
+                    .apply()
+
+                val effective = if (_manualOverride.value != "AUTO") _manualOverride.value else summary.winningBackend
+                _activeBackend.value = effective
+                inferenceEngine.activeBackendOverride = effective
+
+                val diagReport = BackendDiagnosticReport(
+                    timestamp = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date()),
+                    tileSize = hw.recommendedTileSizeCpu,
+                    tilePadding = 8,
+                    finalBackend = summary.activeBackendUsed,
+                    executionConfirmed = true
+                )
+                writeBenchmarkFile(getApplication(), diagReport)
+
+                onComplete?.invoke(summary)
+            } catch (e: Exception) {
+                Log.e("AppViewModel", "Calibration failed: ${e.message}", e)
+            } finally {
+                _isCalibrating.value = false
+            }
+        }
+    }
+
+    fun checkAndRunCalibrationIfNeeded() {
+        val scale = if (_scaleIndex.value == 0) 2 else 4
+        val fingerprint = getConfigurationFingerprint(scale)
+        val cachedFingerprint = prefs.getString("cachedFingerprint", "")
+        if (cachedFingerprint != fingerprint || !prefs.contains("calibratedWinner")) {
+            runHardwareCalibration(forceRefresh = true)
+        } else {
+            val winner = prefs.getString("calibratedWinner", "MNN_CPU") ?: "MNN_CPU"
+            _calibratedWinner.value = winner
+            val effective = if (_manualOverride.value != "AUTO") _manualOverride.value else winner
+            _activeBackend.value = effective
+            inferenceEngine.activeBackendOverride = effective
+        }
+    }
+
+    private val _isProcessing = MutableStateFlow(false)
+    val isProcessing = _isProcessing.asStateFlow()
+
+    private fun getFreeStorageGb(): Double {
+        return try {
+            val stat = android.os.StatFs(getApplication<Application>().filesDir.absolutePath)
+            stat.availableBytes / (1024.0 * 1024.0 * 1024.0)
+        } catch (e: Exception) {
+            1.0
+        }
+    }
+
+    private val _batchItems = MutableStateFlow<List<BatchItem>>(emptyList())
+    val batchItems = _batchItems.asStateFlow()
+
+    private val _resultOrigin = MutableStateFlow(ResultOrigin.Processing)
+    val resultOrigin = _resultOrigin.asStateFlow()
+
+    fun clearSelectedImages() {
+        _selectedImages.value = emptyList()
+        _batchItems.value = emptyList()
+        _batchResults.value = emptyList()
+        _resultBitmap.value = null
+        _selectedResultIndex.value = 0
+    }
+
+    fun openHistoricalResult(entity: HistoryEntity, onReady: () -> Unit) {
+        viewModelScope.launch {
+            _resultOrigin.value = ResultOrigin.History
+            _scaleIndex.value = if (entity.scale == 2 || entity.label.contains("2x", true) || entity.label.contains("2×", true)) 0 else 1
+            val processed = ProcessedItem(
+                originalUri = entity.originalUri,
+                enhancedUri = entity.enhancedUri,
+                width = if (entity.actualWidth > 0) entity.actualWidth else 0,
+                height = if (entity.actualHeight > 0) entity.actualHeight else 0
+            )
+            _selectedImages.value = listOf(entity.originalUri)
+            _batchResults.value = listOf(processed)
+            _batchItems.value = listOf(BatchItem(entity.originalUri, BatchItemStatus.Success, processed))
+            _selectedResultIndex.value = 0
+            val bitmap = withContext(Dispatchers.IO) {
+                loadBitmapFromUri(entity.enhancedUri)
+            }
+            _resultBitmap.value = bitmap
+            onReady()
+        }
+    }
+
 
     private val db = AppDatabase.getDatabase(application)
     
     val history = db.historyDao().getAllHistory()
+    val historyList = history
 
     init {
         viewModelScope.launch(Dispatchers.IO) {
             migrateExistingCacheHistory()
+            checkAndRunCalibrationIfNeeded()
         }
     }
 
@@ -153,10 +304,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setSelectedResultIndex(index: Int) {
-        if (index in _batchResults.value.indices) {
+        if (index in _batchItems.value.indices) {
             _selectedResultIndex.value = index
-            val item = _batchResults.value[index]
-            _resultBitmap.value = loadBitmapFromUri(item.enhancedUri)
+            val item = _batchItems.value[index].processedItem ?: _batchResults.value.getOrNull(index)
+            if (item != null) {
+                viewModelScope.launch(Dispatchers.IO) {
+                    val bitmap = loadBitmapFromUri(item.enhancedUri)
+                    _resultBitmap.value = bitmap
+                }
+            }
         }
     }
     
@@ -173,30 +329,69 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             processingJob = null
         }
         inferenceEngine.cancel()
+        _isProcessing.value = false
         _progress.value = 0f
         _resultBitmap.value = null
         _errorMessage.value = null
         _batchResults.value = emptyList()
         _selectedResultIndex.value = 0
+        _batchItems.value = _batchItems.value.map { item ->
+            if (item.status == BatchItemStatus.Processing || item.status == BatchItemStatus.Waiting) {
+                item.copy(status = BatchItemStatus.Cancelled)
+            } else {
+                item
+            }
+        }
+        UpscaleForegroundService.stop(getApplication())
     }
 
     fun setSelectedImages(urls: List<String>) {
         _selectedImages.value = urls
     }
 
+    private var onBatchCompleteCallback: (() -> Unit)? = null
+
     fun startProcessing(onComplete: () -> Unit) {
+        onBatchCompleteCallback = onComplete
+        if (_isProcessing.value) {
+            Log.d("PIXELBOOST", "startProcessing called while already processing, ignoring duplicate call.")
+            return
+        }
+
         if (_selectedImages.value.isEmpty()) {
             onComplete()
+            return
+        }
+
+        if (getFreeStorageGb() < 0.1) {
+            _errorMessage.value = "Insufficient storage space (at least 100 MB required)"
             return
         }
 
         val autoSaveEnabled = _saveEnhanced.value
         val exportFormatIdx = _formatIndex.value
         val exportQualityIdx = _qualityIndex.value
+        val requestedScale = if (_scaleIndex.value == 0) 2 else 4
 
         val previousJob = processingJob
         cancelProcessing()
+
+        _isProcessing.value = true
+        _resultOrigin.value = ResultOrigin.Processing
+        _batchItems.value = _selectedImages.value.map { BatchItem(it, BatchItemStatus.Waiting) }
         
+        UpscaleForegroundService.onCancelRequested = {
+            cancelProcessing()
+        }
+
+        val totalItems = _selectedImages.value.size
+        UpscaleForegroundService.startOrUpdate(
+            context = getApplication(),
+            currentIndex = 1,
+            totalCount = totalItems,
+            progress = 0f
+        )
+
         processingJob = viewModelScope.launch {
             var tTotalStart = SystemClock.elapsedRealtimeNanos()
             var decodingNanos = 0L
@@ -211,12 +406,32 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 _itemSaveStatuses.value = emptyMap()
 
                 val results = mutableListOf<ProcessedItem>()
+                var lastNotifiedProgress = -1f
+                var lastNotifiedIndex = -1
                 for ((index, url) in _selectedImages.value.withIndex()) {
                     var bitmap: Bitmap? = null
+                    var originalW = 0
+                    var originalH = 0
                     try {
                         coroutineContext.ensureActive()
                         _currentProcessingIndex.value = index
                         _progress.value = 0f
+                        _batchItems.value = _batchItems.value.toMutableList().also { list ->
+                            if (index in list.indices) {
+                                list[index] = list[index].copy(status = BatchItemStatus.Processing)
+                            }
+                        }
+                        
+                        if (index != lastNotifiedIndex) {
+                            lastNotifiedIndex = index
+                            lastNotifiedProgress = 0f
+                            UpscaleForegroundService.startOrUpdate(
+                                context = getApplication(),
+                                currentIndex = index + 1,
+                                totalCount = totalItems,
+                                progress = 0f
+                            )
+                        }
                         
                         tTotalStart = SystemClock.elapsedRealtimeNanos()
                         decodingNanos = 0L
@@ -268,60 +483,109 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         }
                         
                         if (bitmap != null) {
+                            originalW = bitmap.width
+                            originalH = bitmap.height
                             coroutineContext.ensureActive()
-                            val result = inferenceEngine.process(bitmap) { p ->
+                            val finalResult = inferenceEngine.process(bitmap, requestedScale) { p ->
                                 if (coroutineContext.isActive) {
                                     _progress.value = p
+                                    if (p - lastNotifiedProgress >= 0.05f || p >= 0.99f) {
+                                        lastNotifiedProgress = p
+                                        UpscaleForegroundService.startOrUpdate(
+                                            context = getApplication(),
+                                            currentIndex = index + 1,
+                                            totalCount = totalItems,
+                                            progress = p
+                                        )
+                                    }
                                 }
                             }
                             coroutineContext.ensureActive()
-                            val metrics = inferenceEngine.lastTimingMetrics
+                            if (bitmap != finalResult) {
+                                bitmap.recycle()
+                                bitmap = null
+                            }
                             
-                            var finalResult = result
                             val isAiBackend = inferenceEngine.lastDiagnosticReport?.finalBackend?.startsWith("MNN") == true ||
                                 inferenceEngine.lastDiagnosticReport?.finalBackend?.startsWith("ONNX") == true
-                            var finalLabel = if (isAiBackend) "4x AI Upscale" else "4x Enhanced"
-                            val tFinalScaleStart = SystemClock.elapsedRealtimeNanos()
-                            if (_scaleIndex.value == 0) {
-                                finalResult = Bitmap.createScaledBitmap(result, result.width / 2, result.height / 2, true)
-                                if (finalResult != result) {
-                                    result.recycle()
-                                }
-                                finalLabel = if (isAiBackend) "2x AI Upscale" else "2x Enhanced"
+                            val finalLabel = if (isAiBackend) {
+                                if (requestedScale == 2) "2x AI Upscale" else "4x AI Upscale"
+                            } else {
+                                if (requestedScale == 2) "2x Enhanced" else "4x Enhanced"
                             }
-                            val finalScalingNanos = SystemClock.elapsedRealtimeNanos() - tFinalScaleStart
                             
-                            var pngCompressionNanos = 0L
+                            var compressionNanos = 0L
                             var dbInsertionNanos = 0L
                             var enhancedCachePath = ""
-                            
-                            // Save to persistent filesDir for history automatically
-                            withContext(Dispatchers.IO) {
-                                coroutineContext.ensureActive()
-                                val historyDir = java.io.File(getApplication<Application>().filesDir, "enhanced_history")
-                                if (!historyDir.exists()) {
-                                    historyDir.mkdirs()
+                            var persistentFileToExport: java.io.File? = null
+
+                            // FORMAT & TRANSPARENCY HANDLING:
+                            // When exportFormatIdx == 0 (JPEG) and finalResult.hasAlpha(), composite finalResult onto a white background
+                            // before JPEG compression so transparent PNG/WEBP anime images don't get a black background.
+                            val compositedBitmap = if (exportFormatIdx == 0 && finalResult.hasAlpha()) {
+                                val opaque = Bitmap.createBitmap(finalResult.width, finalResult.height, Bitmap.Config.ARGB_8888)
+                                val canvas = android.graphics.Canvas(opaque)
+                                canvas.drawColor(android.graphics.Color.WHITE)
+                                canvas.drawBitmap(finalResult, 0f, 0f, null)
+                                opaque
+                            } else null
+                            val bitmapToEncode = compositedBitmap ?: finalResult
+
+                            try {
+                                // Save to persistent filesDir for history respecting formatIndex and qualityIndex
+                                withContext(Dispatchers.IO) {
+                                    coroutineContext.ensureActive()
+                                    val historyDir = java.io.File(getApplication<Application>().filesDir, "enhanced_history")
+                                    if (!historyDir.exists()) {
+                                        historyDir.mkdirs()
+                                    }
+                                    val ext = when (exportFormatIdx) {
+                                        0 -> ".jpg"
+                                        2 -> ".webp"
+                                        else -> ".png"
+                                    }
+                                    val mime = when (exportFormatIdx) {
+                                        0 -> "image/jpeg"
+                                        2 -> "image/webp"
+                                        else -> "image/png"
+                                    }
+                                    val compressFormat = when (exportFormatIdx) {
+                                        0 -> Bitmap.CompressFormat.JPEG
+                                        2 -> @Suppress("DEPRECATION") if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) Bitmap.CompressFormat.WEBP_LOSSY else Bitmap.CompressFormat.WEBP
+                                        else -> Bitmap.CompressFormat.PNG
+                                    }
+                                    val quality = getExportQuality(exportFormatIdx, exportQualityIdx)
+
+                                    val persistentFile = java.io.File(historyDir, "PixelBoost_${System.currentTimeMillis()}_$index$ext")
+                                    persistentFileToExport = persistentFile
+                                    val tCompStart = SystemClock.elapsedRealtimeNanos()
+                                    persistentFile.outputStream().use { out ->
+                                        bitmapToEncode.compress(compressFormat, quality, out)
+                                    }
+                                    compressionNanos = SystemClock.elapsedRealtimeNanos() - tCompStart
+                                    
+                                    val tDbStart = SystemClock.elapsedRealtimeNanos()
+                                    val entity = HistoryEntity(
+                                        originalUri = url,
+                                        enhancedUri = "file://${persistentFile.absolutePath}",
+                                        timestamp = System.currentTimeMillis(),
+                                        sizeBytes = persistentFile.length(),
+                                        label = finalLabel,
+                                        actualWidth = finalResult.width,
+                                        actualHeight = finalResult.height,
+                                        mimeType = mime,
+                                        scale = requestedScale,
+                                        originalWidth = originalW,
+                                        originalHeight = originalH
+                                    )
+                                    db.historyDao().insert(entity)
+                                    dbInsertionNanos = SystemClock.elapsedRealtimeNanos() - tDbStart
+                                    enhancedCachePath = "file://${persistentFile.absolutePath}"
                                 }
-                                val persistentFile = java.io.File(historyDir, "PixelBoost_${System.currentTimeMillis()}_$index.png")
-                                val tPngStart = SystemClock.elapsedRealtimeNanos()
-                                persistentFile.outputStream().use { out ->
-                                    finalResult.compress(Bitmap.CompressFormat.PNG, 100, out)
+                            } finally {
+                                if (compositedBitmap != null && !compositedBitmap.isRecycled) {
+                                    compositedBitmap.recycle()
                                 }
-                                val tPngEnd = SystemClock.elapsedRealtimeNanos()
-                                pngCompressionNanos = tPngEnd - tPngStart
-                                
-                                val tDbStart = SystemClock.elapsedRealtimeNanos()
-                                val entity = HistoryEntity(
-                                    originalUri = url,
-                                    enhancedUri = "file://${persistentFile.absolutePath}",
-                                    timestamp = System.currentTimeMillis(),
-                                    sizeBytes = persistentFile.length(),
-                                    label = finalLabel
-                                )
-                                db.historyDao().insert(entity)
-                                val tDbEnd = SystemClock.elapsedRealtimeNanos()
-                                dbInsertionNanos = tDbEnd - tDbStart
-                                enhancedCachePath = "file://${persistentFile.absolutePath}"
                             }
 
                             coroutineContext.ensureActive()
@@ -333,15 +597,20 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             )
                             results.add(item)
                             _batchResults.value = results.toList()
+                            _batchItems.value = _batchItems.value.toMutableList().also { list ->
+                                if (index in list.indices) {
+                                    list[index] = list[index].copy(status = BatchItemStatus.Success, processedItem = item)
+                                }
+                            }
 
-                            if (autoSaveEnabled) {
+                            // Single-pass zero-copy auto save directly from persistent file
+                            if (autoSaveEnabled && persistentFileToExport != null) {
                                 coroutineContext.ensureActive()
                                 try {
-                                    val exportResult = exportBitmapToMediaStore(
+                                    val exportResult = exportFileToMediaStore(
                                         context = getApplication(),
-                                        bitmap = finalResult,
-                                        formatIdx = exportFormatIdx,
-                                        qualityIdx = exportQualityIdx
+                                        file = persistentFileToExport!!,
+                                        formatIdx = exportFormatIdx
                                     )
                                     val status = if (exportResult.isSuccess) GallerySaveStatus.Saved else GallerySaveStatus.Failed
                                     _itemSaveStatuses.value = _itemSaveStatuses.value + (index to status)
@@ -353,8 +622,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                 }
                             }
 
-                            if (index == 0) {
+                            if (_resultBitmap.value == null) {
                                 _resultBitmap.value = finalResult
+                                _selectedResultIndex.value = index
+                            } else if (finalResult != _resultBitmap.value && !finalResult.isRecycled) {
+                                finalResult.recycle()
                             }
                             
                             val tTotalEnd = SystemClock.elapsedRealtimeNanos()
@@ -365,7 +637,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                 outputHeight = finalResult.height,
                                 totalProcessingNanos = totalProcessingNanos,
                                 imagePrepNanos = decodingNanos + exifRotationNanos,
-                                pngCompressionNanos = pngCompressionNanos,
+                                pngCompressionNanos = compressionNanos,
                                 dbInsertionNanos = dbInsertionNanos,
                                 outputGenerated = true
                             )
@@ -378,12 +650,22 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             logPerformanceSummary(diagnosticReport)
                         }
                     } catch (c: CancellationException) {
+                        _batchItems.value = _batchItems.value.toMutableList().also { list ->
+                            if (index in list.indices) {
+                                list[index] = list[index].copy(status = BatchItemStatus.Cancelled)
+                            }
+                        }
                         throw c
                     } catch (t: OutOfMemoryError) {
                         Log.e("PIXELBOOST", "Image too large for this device's memory at index $index", t)
                         try {
                             bitmap?.recycle()
                         } catch (_: Throwable) {}
+                        _batchItems.value = _batchItems.value.toMutableList().also { list ->
+                            if (index in list.indices) {
+                                list[index] = list[index].copy(status = BatchItemStatus.Failed)
+                            }
+                        }
                         _itemSaveStatuses.value = _itemSaveStatuses.value + (index to GallerySaveStatus.Failed)
                         _errorMessage.value = "Image too large for this device's memory"
                         continue
@@ -392,19 +674,33 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         try {
                             bitmap?.recycle()
                         } catch (_: Throwable) {}
+                        _batchItems.value = _batchItems.value.toMutableList().also { list ->
+                            if (index in list.indices) {
+                                list[index] = list[index].copy(status = BatchItemStatus.Failed)
+                            }
+                        }
                         _itemSaveStatuses.value = _itemSaveStatuses.value + (index to GallerySaveStatus.Failed)
                         _errorMessage.value = "Error processing image: ${e.message}"
                         continue
                     }
                 }
-                if (_batchResults.value.isNotEmpty()) {
-                    _selectedResultIndex.value = 0
+                val firstSuccessIdx = _batchItems.value.indexOfFirst { it.status == BatchItemStatus.Success }
+                if (firstSuccessIdx != -1) {
+                    _selectedResultIndex.value = firstSuccessIdx
                     if (_resultBitmap.value == null) {
-                        _resultBitmap.value = loadBitmapFromUri(_batchResults.value[0].enhancedUri)
+                        val uriToLoad = _batchItems.value[firstSuccessIdx].processedItem?.enhancedUri 
+                            ?: _batchResults.value.getOrNull(firstSuccessIdx)?.enhancedUri
+                        if (uriToLoad != null) {
+                            _resultBitmap.value = withContext(Dispatchers.IO) {
+                                loadBitmapFromUri(uriToLoad)
+                            }
+                        }
                     }
                 }
+                val successCount = _batchItems.value.count { it.status == BatchItemStatus.Success }
+                UpscaleForegroundService.complete(getApplication(), successCount.coerceAtLeast(1))
                 if (coroutineContext.isActive) {
-                    onComplete()
+                    onBatchCompleteCallback?.invoke() ?: onComplete()
                 }
             } catch (c: CancellationException) {
                 Log.i("PIXELBOOST", "Processing job cancelled successfully")
@@ -436,6 +732,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 logPerformanceSummary(failureReport)
             } finally {
                 processingJob = null
+                _isProcessing.value = false
+                UpscaleForegroundService.stop(getApplication())
             }
         }
     }
@@ -452,8 +750,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         Log.i(TAG, "Input: ${reportData.inputWidth}x${reportData.inputHeight} -> Output: ${reportData.outputWidth}x${reportData.outputHeight}")
         Log.i(TAG, "Total Processing Duration: ${formatSec(reportData.totalProcessingNanos)}")
         Log.i(TAG, "Image Preparation: ${formatMs(reportData.imagePrepNanos)}")
+        Log.i(TAG, "Session Init: ${formatMs(reportData.sessionInitNanos)}")
         Log.i(TAG, "Backend Inference: ${formatSec(reportData.inferenceNanos)}")
-        Log.i(TAG, "PNG Encoding: ${formatSec(reportData.pngCompressionNanos)}")
+        Log.i(TAG, "Postprocessing: ${formatMs(reportData.postprocessingNanos)}")
+        Log.i(TAG, "Stitching: ${formatMs(reportData.stitchingNanos)}")
+        Log.i(TAG, "Encoding: ${formatSec(reportData.pngCompressionNanos)}")
         Log.i(TAG, "Database Insertion: ${formatMs(reportData.dbInsertionNanos)}")
         Log.i(TAG, "===========================================================")
     }
@@ -497,18 +798,44 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 appendLine("Model Actually Used: ${reportData.modelActuallyUsed}")
                 appendLine()
                 appendLine("-----------------------------------------------------")
-                appendLine("BACKEND SELECTION")
+                appendLine("BACKEND SELECTION & AUTO-TUNING")
                 appendLine("-----------------------------------------------------")
                 appendLine()
-                appendLine("Primary Backend:")
-                appendLine("MNN Vulkan")
+                appendLine("Active Backend Used: ${_activeBackend.value}")
+                appendLine("Calibrated Auto Winner: ${_calibratedWinner.value}")
+                appendLine("Manual Override Status: ${if (_manualOverride.value != "AUTO") "ACTIVE (${_manualOverride.value})" else "AUTO"}")
                 appendLine()
-                appendLine("Fallback 1:")
-                appendLine("MNN CPU")
-                appendLine()
-                appendLine("Fallback 2:")
-                appendLine("ONNX Runtime / XNNPACK")
-                appendLine()
+                val calib = inferenceEngine.lastCalibrationSummary
+                if (calib != null) {
+                    appendLine("Configuration Fingerprint: ${calib.configurationFingerprint}")
+                    appendLine("Calibration Wall-Clock Duration: ${formatMs(calib.calibrationWallClockDurationNanos)}")
+                    appendLine()
+                    appendLine("Stage 1 Screening Matrix (${reportData.tileSize + reportData.tilePadding * 2}x${reportData.tileSize + reportData.tilePadding * 2} padded tile):")
+                    for (res in calib.results) {
+                        appendLine("  - Backend: ${res.backendName}")
+                        appendLine("    Configured & Available: ${if (res.isConfiguredAndAvailable) "YES" else "NO (${res.unavailableReason})"}")
+                        if (res.isConfiguredAndAvailable) {
+                            appendLine("    Warm-Up: ${formatMs(res.warmUpLatencyNanos)}")
+                            appendLine("    Trials: ${res.trialLatenciesNanos.joinToString { formatMs(it) }}")
+                            appendLine("    Median Latency: ${formatMs(res.medianLatencyNanos)}")
+                            appendLine("    Dimensions Verified: ${if (res.outputDimensionsVerified) "YES" else "NO"}")
+                            appendLine("    Pixel Entropy Valid: ${if (res.pixelEntropyValid) "YES" else "NO"}")
+                        }
+                    }
+                    appendLine()
+                    appendLine("Stage 2 Multi-Candidate Validation (4-tile grid):")
+                    for (res in calib.results.filter { it.isConfiguredAndAvailable }) {
+                        appendLine("  - Backend: ${res.backendName}")
+                        appendLine("    Validation Duration: ${formatMs(res.multiTileValidationNanos)}")
+                        appendLine("    Max Seam Delta: ${res.seamDiscontinuityMaxDelta?.let { String.format(java.util.Locale.US, "%.1f", it) } ?: "N/A"}")
+                        appendLine("    Mean Absolute Error (MAE): ${res.meanAbsoluteErrorVsRef?.let { String.format(java.util.Locale.US, "%.2f", it) } ?: "N/A"}")
+                        appendLine("    Validation Passed: ${if (res.validationPassed) "YES" else "NO"}")
+                        appendLine("    Winner Designated: ${if (res.isSelectedWinner) "YES" else "NO"}")
+                    }
+                    appendLine()
+                    appendLine("[DOCUMENTED CONSTRAINT]: Large-image exact resolution fidelity is constrained by on-device bitmap heap limits. An active OOM fallback in InferenceEngine may downscale buffers if heap space is exhausted. Refactoring heap budgeting is scheduled for Phase 2.")
+                    appendLine()
+                }
                 appendLine("-----------------------------------------------------")
                 appendLine("MNN VULKAN")
                 appendLine("-----------------------------------------------------")
@@ -575,15 +902,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 appendLine("Output Resolution: ${if (reportData.outputGenerated) "${reportData.outputWidth}x${reportData.outputHeight}" else "N/A"}")
                 appendLine()
                 appendLine("-----------------------------------------------------")
-                appendLine("PERFORMANCE")
+                appendLine("PERFORMANCE BREAKDOWN")
                 appendLine("-----------------------------------------------------")
                 appendLine()
                 appendLine("Total Processing: ${formatSec(reportData.totalProcessingNanos)}")
                 appendLine("Image Preparation: ${formatMs(reportData.imagePrepNanos)}")
+                appendLine("Session Init: ${formatMs(reportData.sessionInitNanos)}")
                 appendLine("Inference: ${formatSec(reportData.inferenceNanos)} (${reportData.finalBackend})")
                 appendLine("Postprocessing: ${formatMs(reportData.postprocessingNanos)}")
                 appendLine("Stitching: ${formatMs(reportData.stitchingNanos)}")
-                appendLine("PNG Encoding: ${formatSec(reportData.pngCompressionNanos)}")
+                appendLine("Encoding: ${formatSec(reportData.pngCompressionNanos)}")
                 appendLine("History Database: ${formatMs(reportData.dbInsertionNanos)}")
                 appendLine()
                 appendLine("=====================================================")
@@ -592,19 +920,68 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 appendLine()
             }
 
+            // 1. Write report directly into the user's Downloads/PixelBoost folder
+            try {
+                val downloadsDir = java.io.File(
+                    android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS),
+                    "PixelBoost"
+                )
+                if (!downloadsDir.exists()) {
+                    downloadsDir.mkdirs()
+                }
+                val publicBenchmarkFile = java.io.File(downloadsDir, "PixelBoost_Benchmark.txt")
+                publicBenchmarkFile.appendText(report)
+                android.util.Log.i("PIXELBOOST_PERF", "Benchmark appended to Downloads/PixelBoost: ${publicBenchmarkFile.absolutePath}")
+            } catch (e: Exception) {
+                android.util.Log.w("PIXELBOOST_PERF", "Direct file write to Downloads/PixelBoost failed: ${e.message}")
+            }
+
+            // 2. Also write via MediaStore Downloads on Android 10+ (Q+) for scoped storage compliance
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                try {
+                    val resolver = context.contentResolver
+                    val projection = arrayOf(android.provider.MediaStore.MediaColumns._ID)
+                    val selection = "${android.provider.MediaStore.MediaColumns.DISPLAY_NAME} = ? AND ${android.provider.MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?"
+                    val selectionArgs = arrayOf("PixelBoost_Benchmark.txt", "%${android.os.Environment.DIRECTORY_DOWNLOADS}/PixelBoost%")
+                    val cursor = resolver.query(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, projection, selection, selectionArgs, null)
+                    val existingUri = cursor?.use {
+                        if (it.moveToFirst()) {
+                            val id = it.getLong(it.getColumnIndexOrThrow(android.provider.MediaStore.MediaColumns._ID))
+                            android.content.ContentUris.withAppendedId(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, id)
+                        } else null
+                    }
+                    val targetUri = existingUri ?: run {
+                        val cv = android.content.ContentValues().apply {
+                            put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, "PixelBoost_Benchmark.txt")
+                            put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                            put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, "${android.os.Environment.DIRECTORY_DOWNLOADS}/PixelBoost")
+                        }
+                        resolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
+                    }
+                    targetUri?.let { uri ->
+                        resolver.openOutputStream(uri, "wa")?.use { out ->
+                            out.write(report.toByteArray())
+                            out.flush()
+                        }
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.w("PIXELBOOST_PERF", "MediaStore Downloads write failed: ${e.message}")
+                }
+            }
+
+            // 3. Always write to internal filesDir diagnostics as well
             val diagDir = java.io.File(context.filesDir, "diagnostics")
             if (!diagDir.exists()) {
                 diagDir.mkdirs()
             }
             val benchmarkFile = java.io.File(diagDir, "PixelBoost_Benchmark.txt")
             benchmarkFile.appendText(report)
-            android.util.Log.i("PIXELBOOST_PERF", "Benchmark appended to: ${benchmarkFile.absolutePath}")
+            android.util.Log.i("PIXELBOOST_PERF", "Benchmark appended to internal diagnostics: ${benchmarkFile.absolutePath}")
         } catch (e: Exception) {
             android.util.Log.e("PIXELBOOST_PERF", "Failed writing benchmark report", e)
         }
     }
 
-    
     fun clearHistory() {
         viewModelScope.launch(Dispatchers.IO) {
             db.historyDao().clearHistory()
@@ -641,8 +1018,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 "${context.packageName}.fileprovider",
                 file
             )
+            val ext = file.extension.lowercase()
+            val mime = when (ext) {
+                "jpg", "jpeg" -> "image/jpeg"
+                "webp" -> "image/webp"
+                else -> "image/png"
+            }
             val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
-                type = "image/png"
+                type = mime
                 putExtra(android.content.Intent.EXTRA_STREAM, uri)
                 addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
@@ -657,6 +1040,77 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             0 -> if (qualityIndex == 0) 90 else 100 // JPEG: High -> 90, Maximum -> 100
             2 -> if (qualityIndex == 0) 85 else 100 // WEBP: High -> 85, Maximum -> 100
             else -> 100 // PNG: Lossless
+        }
+    }
+
+    private suspend fun exportFileToMediaStore(
+        context: Context,
+        file: java.io.File,
+        formatIdx: Int
+    ): Result<Uri> = withContext(Dispatchers.IO) {
+        var insertedUri: Uri? = null
+        try {
+            val ext = when (formatIdx) {
+                0 -> ".jpg"
+                2 -> ".webp"
+                else -> ".png"
+            }
+            val mime = when (formatIdx) {
+                0 -> "image/jpeg"
+                2 -> "image/webp"
+                else -> "image/png"
+            }
+            val filename = "PixelBoost_${System.currentTimeMillis()}$ext"
+            val contentValues = android.content.ContentValues().apply {
+                put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, filename)
+                put(android.provider.MediaStore.MediaColumns.MIME_TYPE, mime)
+                put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, android.os.Environment.DIRECTORY_PICTURES + "/PixelBoost")
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    put(android.provider.MediaStore.MediaColumns.IS_PENDING, 1)
+                }
+            }
+            val uri = context.contentResolver.insert(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+                ?: return@withContext Result.failure(Exception("Failed to create MediaStore entry"))
+            insertedUri = uri
+
+            val writeSucceeded = context.contentResolver.openOutputStream(uri)?.use { out ->
+                file.inputStream().use { input ->
+                    input.copyTo(out)
+                }
+                out.flush()
+                true
+            } ?: false
+
+            if (!writeSucceeded) {
+                try {
+                    context.contentResolver.delete(uri, null, null)
+                } catch (_: Exception) {}
+                return@withContext Result.failure(Exception("Failed to write image"))
+            }
+
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                val updateValues = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.MediaColumns.IS_PENDING, 0)
+                }
+                context.contentResolver.update(uri, updateValues, null, null)
+            }
+
+            Result.success(uri)
+        } catch (c: CancellationException) {
+            insertedUri?.let { uri ->
+                try {
+                    context.contentResolver.delete(uri, null, null)
+                } catch (_: Exception) {}
+            }
+            throw c
+        } catch (e: Exception) {
+            android.util.Log.e("PIXELBOOST", "Error saving file to gallery", e)
+            insertedUri?.let { uri ->
+                try {
+                    context.contentResolver.delete(uri, null, null)
+                } catch (_: Exception) {}
+            }
+            Result.failure(e)
         }
     }
 
@@ -742,26 +1196,35 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (_itemSaveStatuses.value[currentIndex] == GallerySaveStatus.Saved) return
         if (_saveState.value is SaveState.Saving) return
 
-        val currentItem = _batchResults.value.getOrNull(currentIndex)
-        val bitmap = _resultBitmap.value ?: run {
-            try {
-                val path = currentItem?.enhancedUri?.let { Uri.parse(it).path }
-                if (path != null) BitmapFactory.decodeFile(path) else null
-            } catch (e: Exception) {
-                null
-            }
-        }
-        if (bitmap == null) {
-            _saveState.value = SaveState.Error(currentIndex, "Bitmap not available")
-            return
-        }
         val formatIdx = _formatIndex.value
         val qualityIdx = _qualityIndex.value
         _saveState.value = SaveState.Saving
         _itemSaveStatuses.value = _itemSaveStatuses.value + (currentIndex to GallerySaveStatus.Saving)
 
         viewModelScope.launch(Dispatchers.IO) {
-            val exportResult = exportBitmapToMediaStore(context, bitmap, formatIdx, qualityIdx)
+            val currentItem = _batchItems.value.getOrNull(currentIndex)?.processedItem ?: _batchResults.value.getOrNull(currentIndex)
+            val persistentPath = currentItem?.enhancedUri?.let { Uri.parse(it).path }
+            val persistentFile = if (persistentPath != null) java.io.File(persistentPath) else null
+
+            val exportResult = if (persistentFile != null && persistentFile.exists() && persistentFile.length() > 0) {
+                // Single-pass zero-copy direct stream of already-compressed file
+                exportFileToMediaStore(context, persistentFile, formatIdx)
+            } else {
+                val bitmap = _resultBitmap.value ?: run {
+                    try {
+                        if (persistentFile != null && persistentFile.exists()) BitmapFactory.decodeFile(persistentFile.absolutePath) else null
+                    } catch (e: Exception) {
+                        null
+                    }
+                }
+                if (bitmap == null) {
+                    _itemSaveStatuses.value = _itemSaveStatuses.value + (currentIndex to GallerySaveStatus.Failed)
+                    _saveState.value = SaveState.Error(currentIndex, "Bitmap not available")
+                    return@launch
+                }
+                exportBitmapToMediaStore(context, bitmap, formatIdx, qualityIdx)
+            }
+
             if (exportResult.isSuccess) {
                 _itemSaveStatuses.value = _itemSaveStatuses.value + (currentIndex to GallerySaveStatus.Saved)
                 _saveState.value = SaveState.Success(currentIndex)
@@ -769,6 +1232,48 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 val ex = exportResult.exceptionOrNull()
                 _itemSaveStatuses.value = _itemSaveStatuses.value + (currentIndex to GallerySaveStatus.Failed)
                 _saveState.value = SaveState.Error(currentIndex, ex?.localizedMessage ?: "Save failed")
+            }
+        }
+    }
+
+    fun deleteHistoryItem(entity: HistoryEntity) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                db.historyDao().deleteById(entity.id)
+                val path = Uri.parse(entity.enhancedUri).path
+                if (path != null) {
+                    val file = java.io.File(path)
+                    if (file.exists()) {
+                        file.delete()
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("PIXELBOOST", "Failed to delete history item ${entity.id}", e)
+            }
+        }
+    }
+
+    fun shareHistoryItem(context: Context, entity: HistoryEntity) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val path = Uri.parse(entity.enhancedUri).path ?: return@launch
+                val file = java.io.File(path)
+                if (!file.exists()) return@launch
+                val uri = androidx.core.content.FileProvider.getUriForFile(
+                    context,
+                    "${context.packageName}.fileprovider",
+                    file
+                )
+                val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                    type = entity.mimeType.ifBlank { "image/png" }
+                    putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                context.startActivity(android.content.Intent.createChooser(intent, "Share Image").apply {
+                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                })
+            } catch (e: Exception) {
+                Log.e("PIXELBOOST", "Failed to share history item ${entity.id}", e)
             }
         }
     }

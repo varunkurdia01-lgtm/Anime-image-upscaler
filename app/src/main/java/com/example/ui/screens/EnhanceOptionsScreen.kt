@@ -20,10 +20,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.*
-import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.role
-import androidx.compose.ui.semantics.selected
-import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
@@ -44,12 +40,9 @@ fun EnhanceOptionsScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit
     val context = LocalContext.current
     var origW by remember { mutableIntStateOf(0) }
     var origH by remember { mutableIntStateOf(0) }
-    val origText = if (origW > 0 && origH > 0) "${origW} × ${origH}" else "Detecting..."
     LaunchedEffect(selectedImages) {
         val uriStr = selectedImages.firstOrNull() ?: return@LaunchedEffect
-        val dims = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            com.example.data.ImageSourceResolver.getImageDimensions(context, uriStr)
-        }
+        val dims = com.example.data.ImageSourceResolver.getImageDimensions(context, uriStr)
         if (dims != null) {
             origW = dims.first
             origH = dims.second
@@ -133,7 +126,6 @@ fun EnhanceOptionsScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit
                 }
 
                 // Bottom Badge
-                val origText = if (origW > 0 && origH > 0) "${origW} × ${origH}" else "Detecting..."
                 Row(
                     modifier = Modifier
                         .align(Alignment.BottomEnd)
@@ -142,7 +134,11 @@ fun EnhanceOptionsScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit
                         .padding(horizontal = 10.dp, vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(text = origText, style = MaterialTheme.typography.labelSmall, color = Color.White)
+                    Text(
+                        text = if (origW == 0 || origH == 0) "Detecting..." else "${origW} × ${origH}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color.White
+                    )
                 }
             }
         }
@@ -151,13 +147,18 @@ fun EnhanceOptionsScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit
 
         // Options
         val upscalingSubtitle = if (scaleIndex == 0) "2× Precision Super-Resolution" else "4× Ultra Clarity Super-Resolution"
-        OptionSection(title = "Upscaling", subtitle = upscalingSubtitle, options = listOf("2×", "4×"), selected = listOf("2×", "4×")[scaleIndex], onSelect = { viewModel.setScaleIndex(listOf("2×", "4×").indexOf(it)) })
+        OptionSection(
+            title = "Upscaling",
+            subtitle = upscalingSubtitle,
+            options = listOf("2×", "4×"),
+            selected = listOf("2×", "4×")[scaleIndex],
+            onSelect = { viewModel.setScaleIndex(listOf("2×", "4×").indexOf(it)) }
+        )
         Spacer(modifier = Modifier.height(16.dp))
         val formatSubtitle = when (formatIndex) {
-            0 -> "RGB Only • Standard Lossy Compression"
-            1 -> "Preserves Alpha • Lossless Container"
-            2 -> "Preserves Alpha • Efficient Modern Encoding"
-            else -> "Standard Image Format"
+            0 -> "Lossy • Smallest File Size"
+            1 -> "Lossless • Preserves Alpha"
+            else -> "Modern • Preserves Alpha"
         }
         OptionSection(
             title = "Output Format",
@@ -167,17 +168,27 @@ fun EnhanceOptionsScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit
             onSelect = { viewModel.setFormatIndex(listOf("JPG", "PNG", "WEBP").indexOf(it)) }
         )
         Spacer(modifier = Modifier.height(16.dp))
-        val qualitySubtitle = when (formatIndex) {
-            1 -> "Lossless Compression • Pixel-Perfect Fidelity"
-            else -> if (qualityIndex == 0) "High: Optimized File Size • Balanced Quality" else "Maximum: Full Bitrate • Best Fidelity"
+        val qualitySubtitle = if (formatIndex == 1) {
+            "Lossless PNG Compression"
+        } else if (qualityIndex == 0) {
+            "High: Smaller file size • great quality"
+        } else {
+            "Maximum: Larger file size • best fidelity"
         }
-        OptionSection(title = "Image Quality", subtitle = qualitySubtitle, options = listOf("High", "Maximum"), selected = listOf("High", "Maximum")[qualityIndex], onSelect = { viewModel.setQualityIndex(listOf("High", "Maximum").indexOf(it)) })
+        OptionSection(
+            title = "Image Quality",
+            subtitle = qualitySubtitle,
+            options = listOf("High", "Maximum"),
+            selected = listOf("High", "Maximum")[qualityIndex],
+            onSelect = { viewModel.setQualityIndex(listOf("High", "Maximum").indexOf(it)) }
+        )
 
         Spacer(modifier = Modifier.height(24.dp))
 
         // Resolution Transformation Card
-        val requestedScale = if (scaleIndex == 0) 2 else 4
-        val outputText = if (origW > 0 && origH > 0) "${origW * requestedScale} × ${origH * requestedScale}" else "—"
+        val scaleMultiplier = if (scaleIndex == 0) 2 else 4
+        val outputW = origW * scaleMultiplier
+        val outputH = origH * scaleMultiplier
 
         Row(
             modifier = Modifier
@@ -193,7 +204,11 @@ fun EnhanceOptionsScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit
         ) {
             Column {
                 Text(text = "Original", style = MaterialTheme.typography.labelSmall, color = Outline)
-                Text(text = origText, style = MaterialTheme.typography.headlineSmall, color = OnSurface)
+                Text(
+                    text = if (origW == 0 || origH == 0) "Detecting..." else "${origW} × ${origH}",
+                    style = MaterialTheme.typography.headlineSmall,
+                    color = OnSurface
+                )
             }
             Box(
                 modifier = Modifier
@@ -210,7 +225,7 @@ fun EnhanceOptionsScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit
             Column(horizontalAlignment = Alignment.End) {
                 Text(text = "Output", style = MaterialTheme.typography.labelSmall, color = Primary, fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
                 Text(
-                    text = outputText,
+                    text = if (origW == 0 || origH == 0) "—" else "${outputW} × ${outputH}",
                     style = MaterialTheme.typography.headlineSmall,
                     color = Primary,
                     fontWeight = androidx.compose.ui.text.font.FontWeight.Bold
@@ -220,50 +235,30 @@ fun EnhanceOptionsScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        val isSelectionValid = selectedImages.isNotEmpty()
         Button(
             onClick = onStartEnhance,
-            enabled = isSelectionValid,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(56.dp)
                 .ceramicShadow(
                     cornerRadius = 28.dp,
                     offsetX = 0.dp, offsetY = 8.dp, blurRadius = 24.dp,
-                    darkAlpha = if (isSelectionValid) 0.35f else 0.08f, lightAlpha = 0f
+                    darkAlpha = 0.35f, lightAlpha = 0f
                 ),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = Color.Transparent,
-                disabledContainerColor = Color.Transparent
-            ),
+            colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent),
             contentPadding = PaddingValues(0.dp),
             shape = CircleShape
         ) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(
-                        if (isSelectionValid) {
-                            Brush.verticalGradient(listOf(GradientStart, GradientEnd))
-                        } else {
-                            Brush.verticalGradient(listOf(SurfaceContainerHigh, SurfaceContainerHighest))
-                        }
-                    ),
+                    .background(Brush.verticalGradient(listOf(GradientStart, GradientEnd))),
                 contentAlignment = Alignment.Center
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        imageVector = Icons.Outlined.AutoFixHigh,
-                        contentDescription = null,
-                        tint = if (isSelectionValid) OnPrimary else OnSurfaceVariant,
-                        modifier = Modifier.size(20.dp)
-                    )
+                    Icon(imageVector = Icons.Outlined.AutoFixHigh, contentDescription = null, tint = OnPrimary, modifier = Modifier.size(20.dp))
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "Enhance & Upscale",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = if (isSelectionValid) OnPrimary else OnSurfaceVariant
-                    )
+                    Text(text = "Enhance & Upscale", style = MaterialTheme.typography.labelLarge, color = OnPrimary)
                 }
             }
         }
@@ -272,7 +267,7 @@ fun EnhanceOptionsScreen(viewModel: com.example.AppViewModel, onBack: () -> Unit
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
             Icon(imageVector = Icons.Outlined.Info, contentDescription = null, tint = Primary, modifier = Modifier.size(16.dp))
             Spacer(modifier = Modifier.width(6.dp))
-            Text(text = "Neural Super-Resolution • Hardware Accelerated", style = MaterialTheme.typography.labelSmall, color = OnSurfaceVariant)
+            Text(text = "Hardware-accelerated Neural Processing", style = MaterialTheme.typography.labelSmall, color = OnSurfaceVariant)
         }
 
         Spacer(modifier = Modifier.height(32.dp))
@@ -284,7 +279,7 @@ fun OptionSection(title: String, subtitle: String, options: List<String>, select
     Column(modifier = Modifier.fillMaxWidth()) {
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Text(text = title.uppercase(), style = MaterialTheme.typography.labelMedium, color = OnSurfaceVariant)
-            Text(text = subtitle, style = MaterialTheme.typography.labelSmall, color = if (selected == options.last()) Primary else Outline)
+            Text(text = subtitle, style = MaterialTheme.typography.labelSmall, color = Primary)
         }
         Spacer(modifier = Modifier.height(6.dp))
         Row(
@@ -305,10 +300,6 @@ fun OptionSection(title: String, subtitle: String, options: List<String>, select
                         .weight(1f)
                         .fillMaxHeight()
                         .clip(RoundedCornerShape(18.dp))
-                        .semantics {
-                            this.selected = isSelected
-                            role = Role.Tab
-                        }
                         .tactileClick { onSelect(option) }
                         .background(if (isSelected) SecondaryContainer else Color.Transparent),
                     contentAlignment = Alignment.Center

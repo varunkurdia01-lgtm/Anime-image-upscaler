@@ -29,6 +29,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import androidx.core.content.ContextCompat
+import android.os.Build
 import com.example.ui.components.ceramicInnerShadow
 import com.example.ui.components.ceramicShadow
 import com.example.ui.components.tactileClick
@@ -36,7 +38,32 @@ import com.example.ui.theme.*
 import com.example.R
 
 @Composable
-fun HomeScreen(viewModel: com.example.AppViewModel, onNavigateToPicker: () -> Unit = {}, onNavigateToSettings: () -> Unit = {}, onNavigateToHistory: () -> Unit = {}, onStartEnhance: () -> Unit = {}) {
+fun HomeScreen(
+    viewModel: com.example.AppViewModel,
+    onNavigateToPicker: () -> Unit = {},
+    onNavigateToSettings: () -> Unit = {},
+    onNavigateToHistory: () -> Unit = {},
+    onStartEnhance: () -> Unit = {},
+    onNavigateToProcessing: () -> Unit = {},
+    onOpenResult: (com.example.data.HistoryEntity) -> Unit = {}
+) {
+    val context = LocalContext.current
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val notificationPermissionLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { /* granted / denied */ }
+        
+        LaunchedEffect(Unit) {
+            val permissionStatus = ContextCompat.checkSelfPermission(
+                context,
+                android.Manifest.permission.POST_NOTIFICATIONS
+            )
+            if (permissionStatus != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                notificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+    }
     val photoPickerLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.PickMultipleVisualMedia(maxItems = 10)
     ) { uris ->
@@ -49,6 +76,14 @@ fun HomeScreen(viewModel: com.example.AppViewModel, onNavigateToPicker: () -> Un
         ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
         if (uris.isNotEmpty()) {
+            uris.forEach { uri ->
+                try {
+                    context.contentResolver.takePersistableUriPermission(
+                        uri,
+                        android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                } catch (_: Exception) {}
+            }
             viewModel.setSelectedImages(uris.map { it.toString() })
             onStartEnhance()
         }
@@ -136,8 +171,14 @@ fun HomeScreen(viewModel: com.example.AppViewModel, onNavigateToPicker: () -> Un
             Spacer(modifier = Modifier.height(24.dp))
 
             // Intro Text
+            val currentHour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
+            val greeting = when (currentHour) {
+                in 5..11 -> "Good Morning"
+                in 12..16 -> "Good Afternoon"
+                else -> "Good Evening"
+            }
             Text(
-                text = "Good Morning, let's make your photos look better.",
+                text = "$greeting, let's make your photos look better.",
                 style = MaterialTheme.typography.labelMedium,
                 color = OnSurfaceVariant,
                 fontWeight = FontWeight.Normal
@@ -156,6 +197,21 @@ fun HomeScreen(viewModel: com.example.AppViewModel, onNavigateToPicker: () -> Un
                 style = MaterialTheme.typography.bodyMedium,
                 color = OnSurfaceVariant
             )
+
+            val isProcessing by viewModel.isProcessing.collectAsState()
+            val progress by viewModel.progress.collectAsState()
+            val currentProcessingIndex by viewModel.currentProcessingIndex.collectAsState()
+            val batchItems by viewModel.batchItems.collectAsState()
+
+            if (isProcessing) {
+                Spacer(modifier = Modifier.height(16.dp))
+                OngoingProcessingBanner(
+                    currentIndex = currentProcessingIndex + 1,
+                    totalCount = batchItems.size.coerceAtLeast(1),
+                    progress = progress,
+                    onClick = onNavigateToProcessing
+                )
+            }
 
             Spacer(modifier = Modifier.height(24.dp))
 
@@ -195,7 +251,7 @@ fun HomeScreen(viewModel: com.example.AppViewModel, onNavigateToPicker: () -> Un
             Spacer(modifier = Modifier.height(12.dp))
 
             // Recent Grid
-            RecentGrid(viewModel)
+            RecentGrid(viewModel, onOpenResult)
         }
     }
 }
@@ -353,7 +409,10 @@ fun ImportCard(onNavigateToPicker: () -> Unit = {}, onBrowseFiles: () -> Unit = 
 }
 
 @Composable
-fun RecentGrid(viewModel: com.example.AppViewModel) {
+fun RecentGrid(
+    viewModel: com.example.AppViewModel,
+    onOpenResult: (com.example.data.HistoryEntity) -> Unit = {}
+) {
     val items by viewModel.history.collectAsState(initial = emptyList())
     
 
@@ -364,7 +423,9 @@ fun RecentGrid(viewModel: com.example.AppViewModel) {
     ) {
         items(items.take(3)) { item ->
             Column(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .tactileClick { onOpenResult(item) },
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Box(
@@ -407,3 +468,102 @@ fun RecentGrid(viewModel: com.example.AppViewModel) {
         }
     }
 }
+
+@Composable
+fun OngoingProcessingBanner(
+    currentIndex: Int,
+    totalCount: Int,
+    progress: Float,
+    onClick: () -> Unit
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .tactileClick { onClick() }
+            .ceramicShadow(
+                cornerRadius = 20.dp,
+                offsetX = 4.dp,
+                offsetY = 4.dp,
+                blurRadius = 12.dp
+            ),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = SurfaceContainerLowest
+        )
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .background(Primary.copy(alpha = 0.12f), CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        CircularProgressIndicator(
+                            progress = { progress.coerceIn(0f, 1f) },
+                            modifier = Modifier.size(24.dp),
+                            color = Primary,
+                            strokeWidth = 3.dp,
+                            trackColor = Primary.copy(alpha = 0.2f)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column {
+                        Text(
+                            text = "Background Upscaling Active",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = OnSurface
+                        )
+                        Text(
+                            text = "Processing image $currentIndex of $totalCount • ${(progress * 100).toInt()}%",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = OnSurfaceVariant
+                        )
+                    }
+                }
+                Icon(
+                    imageVector = Icons.Outlined.ArrowForward,
+                    contentDescription = "View Ongoing Processing",
+                    tint = Primary,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+            LinearProgressIndicator(
+                progress = { progress.coerceIn(0f, 1f) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(6.dp)
+                    .clip(RoundedCornerShape(3.dp)),
+                color = Primary,
+                trackColor = SurfaceContainerHigh
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End
+            ) {
+                Text(
+                    text = "View Ongoing Processing →",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Primary
+                )
+            }
+        }
+    }
+}
+

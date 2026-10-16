@@ -32,22 +32,19 @@ import com.example.ui.theme.*
 import com.example.AppViewModel
 
 @Composable
-fun ProcessingScreen(viewModel: com.example.AppViewModel, onCancel: () -> Unit, onFinish: () -> Unit) {
+fun ProcessingScreen(
+    viewModel: com.example.AppViewModel,
+    onCancel: () -> Unit,
+    onNavigateBack: () -> Unit = onCancel,
+    onFinish: () -> Unit
+) {
     val progress by viewModel.progress.collectAsState()
     val errorText by viewModel.errorMessage.collectAsState()
     val scaleIndex by viewModel.scaleIndex.collectAsState()
-    val selectedImages by viewModel.selectedImages.collectAsState()
-    val currentIndex by viewModel.currentProcessingIndex.collectAsState()
-    val batchItems by viewModel.batchItems.collectAsState()
+    val isProcessing by viewModel.isProcessing.collectAsState()
 
     BackHandler {
-        onCancel()
-    }
-
-    LaunchedEffect(selectedImages) {
-        if (selectedImages.isEmpty()) {
-            onCancel()
-        }
+        onNavigateBack()
     }
     
     LaunchedEffect(Unit) {
@@ -56,11 +53,13 @@ fun ProcessingScreen(viewModel: com.example.AppViewModel, onCancel: () -> Unit, 
         }
     }
 
-    val animatedProgress by animateFloatAsState(
-        targetValue = progress,
-        animationSpec = if (progress <= 0.05f) androidx.compose.animation.core.snap() else androidx.compose.animation.core.tween(),
-        label = "progress"
-    )
+    LaunchedEffect(isProcessing) {
+        if (!isProcessing && viewModel.batchItems.value.any { it.status == com.example.BatchItemStatus.Success }) {
+            onFinish()
+        }
+    }
+
+    val animatedProgress by animateFloatAsState(targetValue = progress, label = "progress")
 
     Column(
         modifier = Modifier
@@ -83,7 +82,10 @@ fun ProcessingScreen(viewModel: com.example.AppViewModel, onCancel: () -> Unit, 
                 color = OnSurface
             )
             IconButton(
-                onClick = onCancel,
+                onClick = {
+                    viewModel.cancelProcessing()
+                    onCancel()
+                },
                 modifier = Modifier
                     .size(40.dp)
                     .ceramicShadow(
@@ -158,6 +160,8 @@ fun ProcessingScreen(viewModel: com.example.AppViewModel, onCancel: () -> Unit, 
         
         Text(text = "Enhancing image", style = MaterialTheme.typography.headlineSmall, color = OnSurface)
         Row(verticalAlignment = Alignment.CenterVertically) {
+            val selectedImages by viewModel.selectedImages.collectAsState()
+            val currentIndex by viewModel.currentProcessingIndex.collectAsState()
             Text(text = "${currentIndex + 1} of ${selectedImages.size}", style = MaterialTheme.typography.bodyMedium, color = OnSurface, fontWeight = androidx.compose.ui.text.font.FontWeight.Medium)
             Spacer(modifier = Modifier.width(6.dp))
             Box(modifier = Modifier.size(4.dp).background(OutlineVariant, CircleShape))
@@ -168,21 +172,19 @@ fun ProcessingScreen(viewModel: com.example.AppViewModel, onCancel: () -> Unit, 
         Spacer(modifier = Modifier.height(40.dp))
 
         // Queue list
-        val queue = selectedImages.mapIndexed { index, url ->
-            val bItem = batchItems.getOrNull(index)
-            val status = when (bItem?.status) {
-                com.example.BatchItemStatus.Success -> "Completed"
+        val batchItems by viewModel.batchItems.collectAsState()
+        val currentIndexState by viewModel.currentProcessingIndex.collectAsState()
+
+        batchItems.forEachIndexed { index, item ->
+            val statusText = when (item.status) {
+                com.example.BatchItemStatus.Waiting -> "Waiting..."
                 com.example.BatchItemStatus.Processing -> "Enhancing... ${(animatedProgress * 100).toInt()}%"
+                com.example.BatchItemStatus.Success -> "Completed"
                 com.example.BatchItemStatus.Failed -> "Failed"
                 com.example.BatchItemStatus.Cancelled -> "Cancelled"
-                else -> if (index == currentIndex) "Enhancing... ${(animatedProgress * 100).toInt()}%" else "Waiting..."
             }
-            Triple("Image ${index+1}", status, url)
-        }
+            val isCurrent = index == currentIndexState && item.status == com.example.BatchItemStatus.Processing
 
-        queue.forEachIndexed { index, item ->
-            val bItem = batchItems.getOrNull(index)
-            val isCurrentActive = bItem?.status == com.example.BatchItemStatus.Processing || (bItem == null && index == currentIndex)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -191,7 +193,7 @@ fun ProcessingScreen(viewModel: com.example.AppViewModel, onCancel: () -> Unit, 
                         cornerRadius = 16.dp,
                         offsetX = 4.dp, offsetY = 4.dp, blurRadius = 12.dp
                     )
-                    .background(if (isCurrentActive) SurfaceContainerLowest else SurfaceContainerLowest.copy(alpha = 0.8f), RoundedCornerShape(16.dp))
+                    .background(if (isCurrent) SurfaceContainerLowest else SurfaceContainerLowest.copy(alpha = 0.8f), RoundedCornerShape(16.dp))
                     .padding(12.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
@@ -199,38 +201,34 @@ fun ProcessingScreen(viewModel: com.example.AppViewModel, onCancel: () -> Unit, 
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
                     Box(modifier = Modifier.size(48.dp).clip(RoundedCornerShape(8.dp))) {
                         AsyncImage(
-                            model = ImageRequest.Builder(LocalContext.current).data(item.third).crossfade(true).build(),
+                            model = ImageRequest.Builder(LocalContext.current).data(item.originalUri).crossfade(true).build(),
                             contentDescription = null,
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize()
                         )
-                        if (isCurrentActive) Box(modifier = Modifier.fillMaxSize().background(Primary.copy(alpha = 0.1f)))
+                        if (isCurrent) Box(modifier = Modifier.fillMaxSize().background(Primary.copy(alpha = 0.1f)))
                     }
                     Spacer(modifier = Modifier.width(12.dp))
                     Column {
-                        Text(text = item.first, style = MaterialTheme.typography.labelLarge, color = OnSurface, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(text = item.second, style = MaterialTheme.typography.bodySmall, color = if (isCurrentActive) Primary else OnSurfaceVariant)
+                        Text(text = "Image ${index + 1}", style = MaterialTheme.typography.labelLarge, color = OnSurface, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(text = statusText, style = MaterialTheme.typography.bodySmall, color = if (isCurrent) Primary else OnSurfaceVariant)
                     }
                 }
-                when (bItem?.status) {
+                when (item.status) {
                     com.example.BatchItemStatus.Processing -> {
                         CircularProgressIndicator(modifier = Modifier.size(24.dp), color = SecondaryContainer, strokeWidth = 3.dp)
                     }
                     com.example.BatchItemStatus.Success -> {
-                        Icon(imageVector = Icons.Outlined.CheckCircle, contentDescription = "Completed", tint = Secondary, modifier = Modifier.size(20.dp))
+                        Icon(imageVector = Icons.Outlined.CheckCircle, contentDescription = null, tint = Primary, modifier = Modifier.size(22.dp))
                     }
                     com.example.BatchItemStatus.Failed -> {
-                        Icon(imageVector = Icons.Outlined.ErrorOutline, contentDescription = "Failed", tint = ErrorColor, modifier = Modifier.size(20.dp))
+                        Icon(imageVector = Icons.Outlined.ErrorOutline, contentDescription = null, tint = ErrorColor, modifier = Modifier.size(22.dp))
                     }
                     com.example.BatchItemStatus.Cancelled -> {
-                        Icon(imageVector = Icons.Outlined.Cancel, contentDescription = "Cancelled", tint = Outline, modifier = Modifier.size(20.dp))
+                        Icon(imageVector = Icons.Outlined.Cancel, contentDescription = null, tint = Outline, modifier = Modifier.size(22.dp))
                     }
-                    else -> {
-                        if (index == currentIndex) {
-                            CircularProgressIndicator(modifier = Modifier.size(24.dp), color = SecondaryContainer, strokeWidth = 3.dp)
-                        } else {
-                            Icon(imageVector = Icons.Outlined.HourglassEmpty, contentDescription = "Waiting", tint = Outline, modifier = Modifier.size(20.dp))
-                        }
+                    com.example.BatchItemStatus.Waiting -> {
+                        Icon(imageVector = Icons.Outlined.HourglassEmpty, contentDescription = null, tint = Outline, modifier = Modifier.size(20.dp))
                     }
                 }
             }
@@ -250,7 +248,10 @@ fun ProcessingScreen(viewModel: com.example.AppViewModel, onCancel: () -> Unit, 
             }
         }
         Button(
-            onClick = onCancel,
+            onClick = {
+                viewModel.cancelProcessing()
+                onCancel()
+            },
             colors = ButtonDefaults.buttonColors(containerColor = SurfaceContainerLow, contentColor = ErrorColor),
             modifier = Modifier
                 .fillMaxWidth(0.8f)

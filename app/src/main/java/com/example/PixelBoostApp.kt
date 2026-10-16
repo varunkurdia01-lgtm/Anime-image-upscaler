@@ -14,10 +14,6 @@ import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.role
-import androidx.compose.ui.semantics.selected
-import androidx.compose.ui.semantics.semantics
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -79,11 +75,13 @@ fun PixelBoostApp(viewModel: AppViewModel = androidx.lifecycle.viewmodel.compose
             }
         ) {
             composable("home") {
-                HomeScreen(viewModel = viewModel,
+                HomeScreen(
+                    viewModel = viewModel,
                     onNavigateToPicker = { navController.navigate("picker") },
                     onNavigateToSettings = { navController.navigate("settings") },
                     onNavigateToHistory = { navController.navigate("history") },
                     onStartEnhance = { navController.navigate("enhance_options") },
+                    onNavigateToProcessing = { navController.navigate("processing") },
                     onOpenResult = { entity ->
                         viewModel.openHistoricalResult(entity) {
                             navController.navigate("result")
@@ -92,14 +90,7 @@ fun PixelBoostApp(viewModel: AppViewModel = androidx.lifecycle.viewmodel.compose
                 )
             }
             composable("history") {
-                HistoryScreen(
-                    viewModel = viewModel,
-                    onOpenResult = { entity ->
-                        viewModel.openHistoricalResult(entity) {
-                            navController.navigate("result")
-                        }
-                    }
-                )
+                HistoryScreen(viewModel = viewModel, onOpenResult = { navController.navigate("result") })
             }
             composable("settings") {
                 SettingsScreen(viewModel = viewModel, onBack = { navController.popBackStack() })
@@ -117,11 +108,7 @@ fun PixelBoostApp(viewModel: AppViewModel = androidx.lifecycle.viewmodel.compose
                 EnhanceOptionsScreen(
                     viewModel = viewModel,
                     onBack = { navController.popBackStack() },
-                    onStartEnhance = {
-                        if (viewModel.selectedImages.value.isNotEmpty()) {
-                            navController.navigate("processing")
-                        }
-                    }
+                    onStartEnhance = { navController.navigate("processing") }
                 )
             }
             composable("processing") {
@@ -130,42 +117,34 @@ fun PixelBoostApp(viewModel: AppViewModel = androidx.lifecycle.viewmodel.compose
                     onCancel = {
                         viewModel.cancelProcessing()
                         if (!navController.popBackStack("enhance_options", false)) {
-                            if (!navController.popBackStack()) {
-                                navController.navigate("home") { popUpTo(0) }
-                            }
+                            navController.navigate("home")
+                        }
+                    },
+                    onNavigateBack = {
+                        if (!navController.popBackStack()) {
+                            navController.navigate("home")
                         }
                     },
                     onFinish = {
                         navController.navigate("result") {
-                            popUpTo("processing") { inclusive = true }
+                            popUpTo("home") { inclusive = false }
                         }
                     }
                 )
             }
             composable("result") {
-                val resultOrigin by viewModel.resultOrigin.collectAsState()
                 ResultScreen(
                     viewModel = viewModel,
                     onBack = {
-                        if (resultOrigin == ResultOrigin.History) {
-                            if (!navController.popBackStack()) {
-                                navController.navigate("history") {
-                                    popUpTo("home") { inclusive = false }
-                                }
-                            }
+                        if (viewModel.resultOrigin.value == ResultOrigin.History) {
+                            navController.popBackStack("history", false)
                         } else {
-                            if (!navController.popBackStack()) {
-                                navController.navigate("enhance_options") {
-                                    popUpTo("home") { inclusive = false }
-                                }
-                            }
+                            navController.popBackStack("home", false)
                         }
                     },
                     onUpscaleAnother = {
                         viewModel.clearSelectedImages()
-                        navController.navigate("picker") {
-                            popUpTo("home") { inclusive = false }
-                        }
+                        navController.popBackStack("home", false)
                     }
                 )
             }
@@ -220,12 +199,7 @@ fun BottomNavigationBar(navController: NavHostController) {
                     ),
                     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
                     shape = RoundedCornerShape(24.dp),
-                    modifier = Modifier
-                        .height(44.dp)
-                        .semantics {
-                            selected = isSelected
-                            role = Role.Tab
-                        }
+                    modifier = Modifier.height(44.dp)
                 ) {
                     Row(
                         horizontalArrangement = Arrangement.Center,
